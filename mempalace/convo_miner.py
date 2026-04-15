@@ -397,6 +397,14 @@ def scan_convos(convo_dir: str) -> list:
                     except OSError:
                         pass
                     continue
+                try:
+                    file_size = filepath.stat().st_size
+                    if file_size > MAX_FILE_SIZE:
+                        print(f"  SKIP: {filepath.name} ({file_size / (1024 * 1024):.1f} MB)"
+                              f" exceeds {MAX_FILE_SIZE // (1024 * 1024)} MB limit")
+                        continue
+                except OSError:
+                    continue
                 if not _is_regular_source_file(filepath, convo_path):
                     continue
                 files.append(filepath)
