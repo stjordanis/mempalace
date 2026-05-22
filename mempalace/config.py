@@ -288,6 +288,11 @@ class MempalaceConfig:
         return self._file_config.get("palace_path", DEFAULT_PALACE_PATH)
 
     @property
+    def tunnel_file(self):
+        """Path to the tunnel file, sibling of palace_path."""
+        return os.path.join(os.path.dirname(self.palace_path), "tunnels.json")
+
+    @property
     def collection_name(self):
         """ChromaDB collection name."""
         return self._file_config.get("collection_name", DEFAULT_COLLECTION_NAME)
