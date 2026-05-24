@@ -1173,7 +1173,13 @@ version = "3.3.5"
 source = { editable = "." }
 dependencies = [
     { name = "chromadb" },
+    { name = "huggingface-hub", version = "1.8.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
+    { name = "huggingface-hub", version = "1.9.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.10'" },
+    { name = "numpy", version = "2.0.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.10.*'" },
+    { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "pyyaml" },
+    { name = "tokenizers" },
     { name = "tomli", marker = "python_full_version < '3.11'" },
 ]
 
@@ -1217,6 +1223,8 @@ dev = [
 requires-dist = [
     { name = "autocorrect", marker = "extra == 'spellcheck'", specifier = ">=2.0" },
     { name = "chromadb", specifier = ">=1.5.4,<2" },
+    { name = "huggingface-hub", specifier = ">=0.20" },
+    { name = "numpy", specifier = ">=1.24" },
     { name = "onnxruntime", marker = "extra == 'coreml'", specifier = ">=1.16" },
     { name = "onnxruntime-directml", marker = "extra == 'dml'", specifier = ">=1.16" },
     { name = "onnxruntime-gpu", marker = "extra == 'gpu'", specifier = ">=1.16" },
@@ -1225,9 +1233,10 @@ requires-dist = [
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=4.0" },
     { name = "pyyaml", specifier = ">=6.0,<7" },
     { name = "ruff", marker = "extra == 'dev'", specifier = "==0.15.9" },
+    { name = "tokenizers", specifier = ">=0.15" },
     { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2.0.0" },
 ]
-provides-extras = ["dev", "spellcheck", "gpu", "dml", "coreml"]
+provides-extras = ["dev", "spellcheck", "gpu", "dml", "coreml", "multilingual"]
 
 [package.metadata.requires-dev]
 dev = [
