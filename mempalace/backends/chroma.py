@@ -908,38 +908,40 @@ def _fix_missing_collection_type(palace_path: str) -> None:
     marker = os.path.join(palace_path, _COLLECTION_TYPE_MARKER)
     if os.path.isfile(marker):
         return
+    conn = sqlite3.connect(db_path)
     try:
-        with sqlite3.connect(db_path) as conn:
+        try:
+            rows = conn.execute("SELECT id, config_json_str FROM collections").fetchall()
+        except sqlite3.OperationalError:
+            return
+        updates = []
+        for coll_id, config_str in rows:
+            if not config_str:
+                config_str = "{}"
             try:
-                rows = conn.execute("SELECT id, config_json_str FROM collections").fetchall()
-            except sqlite3.OperationalError:
-                return
-            updates = []
-            for coll_id, config_str in rows:
-                if not config_str:
-                    config_str = "{}"
-                try:
-                    config = json.loads(config_str)
-                except (json.JSONDecodeError, TypeError):
-                    continue
-                if not isinstance(config, dict):
-                    continue
-                if "_type" not in config:
-                    config["_type"] = "CollectionConfigurationInternal"
-                    updates.append((json.dumps(config), coll_id))
-            if updates:
-                conn.executemany(
-                    "UPDATE collections SET config_json_str = ? WHERE id = ?",
-                    updates,
-                )
-                logger.info(
-                    "Fixed %d collection(s) missing _type in config_json_str",
-                    len(updates),
-                )
-                conn.commit()
+                config = json.loads(config_str)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(config, dict):
+                continue
+            if "_type" not in config:
+                config["_type"] = "CollectionConfigurationInternal"
+                updates.append((json.dumps(config), coll_id))
+        if updates:
+            conn.executemany(
+                "UPDATE collections SET config_json_str = ? WHERE id = ?",
+                updates,
+            )
+            conn.commit()
+            logger.info(
+                "Fixed %d collection(s) missing _type in config_json_str",
+                len(updates),
+            )
     except Exception:
         logger.exception("Could not fix collection config_json_str in %s", db_path)
         return
+    finally:
+        conn.close()
     try:
         Path(marker).touch()
     except OSError:
