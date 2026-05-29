@@ -71,7 +71,7 @@ chroma = "mempalace.backends.chroma:ChromaBackend"
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
-    "ruff==0.15.14",
+    "ruff==0.15.15",
     "psutil>=5.9",
     # Property-based testing — generates hundreds of random inputs per
     # test to find counterexamples the hand-written positive tests miss.
@@ -123,7 +123,7 @@ extract = [
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
-    "ruff==0.15.14",
+    "ruff==0.15.15",
     "psutil>=5.9",
     "hypothesis>=6.0",
     "pre-commit>=3.0",
