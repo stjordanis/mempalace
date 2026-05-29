@@ -1976,3 +1976,79 @@ class TestExtractContentDate:
         content = "Y2K reference: 25/01/00.\n"
         f.write_text(content)
         assert _extract_content_date(str(f), content) == "2000-01-25"
+
+
+def test_file_already_mined_handles_multiple_groups_under_one_source_file(tmp_path):
+    """Under the additive-mining model, a single ``source_file`` can have
+    multiple ``parent_drawer_id`` groups in the palace — one per mining pass
+    — each with its own stored ``source_mtime``. ``file_already_mined`` must
+    return True if ANY group's stored mtime matches the file's current
+    mtime, regardless of which group ChromaDB's ``get(..., limit=1)`` happens
+    to return first.
+
+    Current code uses ``collection.get(where={"source_file": X}, limit=1)``
+    which has undefined ordering across multiple matching rows. When ChromaDB
+    returns a stale group (older mining pass with a different stored mtime),
+    the function returns False, the additive miner concludes the file changed,
+    and writes yet another duplicate group for a file that has not actually
+    changed. Steady state: duplicate groups accumulate without bound.
+
+    This test pins the failure space deterministically using a MockCollection
+    that always returns the stale group on limit=1 (worst-case ordering). A
+    correct implementation iterates all groups via the paginated pattern
+    already used in the ``extract_mode is not None`` branch.
+
+    Issue: follow-up to PR #1628 (the every-bare-source_file-query audit).
+    """
+    # Create a real file with known mtime.
+    test_file = tmp_path / "doc.md"
+    test_file.write_text("content that hasn't changed since the latest mine.")
+    current_mtime = os.path.getmtime(str(test_file))
+
+    # Build a MockCollection that simulates two parent_drawer_id groups
+    # under the same source_file with DIFFERENT stored mtimes:
+    #   group_A: stale, source_mtime = current_mtime - 100  (older pass)
+    #   group_B: current, source_mtime = current_mtime      (latest pass)
+    # The mock returns group_A for limit=1 calls (worst-case ordering) and
+    # returns BOTH groups for the paginated limit=1000 calls (what the fix
+    # must use).
+    stale_meta = {
+        "source_file": str(test_file),
+        "chunk_index": 0,
+        "parent_drawer_id": "drawer_group_A",
+        "source_mtime": current_mtime - 100.0,
+        "normalize_version": NORMALIZE_VERSION,
+    }
+    current_meta = {
+        "source_file": str(test_file),
+        "chunk_index": 0,
+        "parent_drawer_id": "drawer_group_B",
+        "source_mtime": current_mtime,
+        "normalize_version": NORMALIZE_VERSION,
+    }
+
+    class MockCollection:
+        """Simulates the ChromaDB get() contract for two parent_drawer_id
+        groups sharing one source_file. Returns the STALE group when called
+        with limit=1 (the worst-case-ordering shape that triggers the bug).
+        Returns BOTH groups (paginated) when called with limit=1000 — what
+        a correctly-iterating implementation must do."""
+
+        def get(self, where=None, limit=None, offset=0, include=None):
+            if limit == 1:
+                return {"ids": ["a_0"], "metadatas": [stale_meta]}
+            if offset == 0:
+                return {"ids": ["a_0", "b_0"], "metadatas": [stale_meta, current_meta]}
+            return {"ids": [], "metadatas": []}
+
+    col = MockCollection()
+
+    # EXPECTED: file_already_mined returns True because at least one stored
+    # group's mtime matches the current file mtime.
+    # CURRENT BUG: returns False because limit=1 grabs the stale group.
+    assert file_already_mined(col, str(test_file), check_mtime=True) is True, (
+        "file_already_mined returned False even though a group with matching "
+        "mtime exists. The limit=1 query picked the stale group; the function "
+        "must iterate all groups for the source_file (mirroring the existing "
+        "paginated pattern in the extract_mode-is-set branch)."
+    )

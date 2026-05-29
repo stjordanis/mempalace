@@ -741,47 +741,51 @@ def file_already_mined(
     treated as exchange-mode drawers.
     """
     try:
-        stored_meta = None
-        if extract_mode is None:
-            results = collection.get(where={"source_file": source_file}, limit=1)
-            if not results.get("ids"):
-                return False
-            stored_meta = results.get("metadatas", [{}])[0] or {}
-        else:
-            offset = 0
-            while True:
-                results = collection.get(
-                    where={"source_file": source_file},
-                    limit=1000,
-                    offset=offset,
-                    include=["metadatas"],
-                )
-                ids = results.get("ids") or []
-                metadatas = results.get("metadatas") or []
-                stored_meta = next(
-                    (
-                        meta or {}
-                        for meta in metadatas
-                        if _metadata_matches_extract_mode(meta or {}, extract_mode)
-                    ),
-                    None,
-                )
-                if stored_meta is not None or not ids:
-                    break
-                offset += len(ids)
-        if stored_meta is None:
-            return False
-        # Pre-v2 drawers have no version field — treat them as stale.
-        stored_version = stored_meta.get("normalize_version", 1)
-        if stored_version < NORMALIZE_VERSION:
-            return False
-        if check_mtime:
-            stored_mtime = stored_meta.get("source_mtime")
-            if stored_mtime is None:
-                return False
-            current_mtime = os.path.getmtime(source_file)
-            return abs(float(stored_mtime) - current_mtime) < 0.001
-        return True
+        # Under the additive-mining model, a single ``source_file`` can have
+        # multiple ``parent_drawer_id`` groups in the palace — one per
+        # mining pass — each with its own stored ``source_mtime`` and
+        # ``normalize_version``. The function must return True if ANY stored
+        # group is current (matching version + matching mtime when checked),
+        # because ChromaDB's ``get(..., limit=1)`` has undefined ordering
+        # across multiple matching rows: a ``limit=1`` shortcut picks
+        # whichever row ChromaDB orders first and only checks that one,
+        # causing spurious re-mines whenever the stale group is returned.
+        # Iterating via the same paginated pattern used in the
+        # extract_mode-is-set branch lets the function short-circuit on the
+        # first matching group regardless of ordering.
+        current_mtime = os.path.getmtime(source_file) if check_mtime else None
+        offset = 0
+        while True:
+            results = collection.get(
+                where={"source_file": source_file},
+                limit=1000,
+                offset=offset,
+                include=["metadatas"],
+            )
+            ids = results.get("ids") or []
+            metadatas = results.get("metadatas") or []
+            for meta in metadatas:
+                meta = meta or {}
+                # extract_mode scoping (was the existing ``else`` branch):
+                if extract_mode is not None and not _metadata_matches_extract_mode(
+                    meta, extract_mode
+                ):
+                    continue
+                # Pre-v2 drawers have no version field — treat them as stale.
+                stored_version = meta.get("normalize_version", 1)
+                if stored_version < NORMALIZE_VERSION:
+                    continue
+                if not check_mtime:
+                    return True
+                stored_mtime = meta.get("source_mtime")
+                if stored_mtime is None:
+                    continue
+                if abs(float(stored_mtime) - current_mtime) < 0.001:
+                    return True
+            if not ids:
+                break
+            offset += len(ids)
+        return False
     except Exception:
         return False
 
