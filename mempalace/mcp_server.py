@@ -1864,7 +1864,7 @@ def tool_kg_stats():
 # ==================== AGENT DIARY ====================
 
 
-def tool_diary_write(agent_name: str, entry: str = None, topic: str = "general", wing: str = "", content: str = None):
+def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: str = ""):
     """
     Write a diary entry for this agent. Entries are timestamped and
     accumulate over time in a diary room.
@@ -1876,13 +1876,6 @@ def tool_diary_write(agent_name: str, entry: str = None, topic: str = "general",
     that diary reads are case-insensitive (see #1243). "Claude",
     "claude", and "CLAUDE" all resolve to the same agent.
     """
-    # Accept 'content' as an alias for 'entry' — add_drawer uses 'content', making
-    # it natural to pattern off it. Accepting both avoids a silent -32000 error.
-    if entry is None and content is not None:
-        entry = content
-    elif entry is None:
-        return {"success": False, "error": "'entry' (or 'content') is required"}
-
     try:
         agent_name = sanitize_name(agent_name, "agent_name").lower()
         entry = sanitize_content(entry)
@@ -2664,6 +2657,10 @@ TOOLS = {
                     "type": "string",
                     "description": "Target wing for this diary entry (optional). If omitted, uses wing_{agent_name}. Use this to write diary entries to a project wing instead of an agent-specific wing.",
                 },
+                "content": {
+                    "type": "string",
+                    "description": "Alias for 'entry' — accepted because add_drawer uses 'content'. Provide either 'entry' or 'content'; 'entry' wins if both are given.",
+                },
             },
             "required": ["agent_name", "entry"],
         },
@@ -2872,6 +2869,15 @@ def handle_request(request):
                     "error": {"code": -32602, "message": f"Invalid value for parameter '{key}'"},
                 }
         tool_args.pop("wait_for_previous", None)
+        # 'content' is an accepted alias for diary_write's 'entry' (callers often
+        # reuse add_drawer's 'content' name). Map it in here, before dispatch, so a
+        # content-only call still satisfies the required 'entry' param while the
+        # signature-based missing-parameter diagnostic (-32602) keeps working.
+        # 'entry' wins if both are supplied.
+        if tool_name == "mempalace_diary_write" and "content" in tool_args:
+            content_val = tool_args.pop("content")
+            if not tool_args.get("entry"):
+                tool_args["entry"] = content_val
         try:
             result = TOOLS[tool_name]["handler"](**tool_args)
             return {

@@ -3323,6 +3323,61 @@ class TestParamShapeDiagnostics:
         assert "'entry'" in message
         assert " and " not in message.split("for tool")[0]
 
+    def test_diary_write_content_aliases_entry(self, monkeypatch):
+        """A content-only diary_write call is remapped to 'entry' before
+        dispatch (#1245 alias), so it satisfies the required param and the
+        alias key is consumed rather than passed through to the handler.
+        """
+        from mempalace import mcp_server
+
+        captured = {}
+
+        def capture(**kwargs):
+            captured.update(kwargs)
+            return {"success": True}
+
+        monkeypatch.setitem(mcp_server.TOOLS["mempalace_diary_write"], "handler", capture)
+        resp = mcp_server.handle_request(
+            {
+                "method": "tools/call",
+                "id": 5,
+                "params": {
+                    "name": "mempalace_diary_write",
+                    "arguments": {"agent_name": "test", "content": "hello world"},
+                },
+            }
+        )
+        assert "error" not in resp
+        assert captured.get("entry") == "hello world"
+        assert "content" not in captured
+
+    def test_diary_write_entry_wins_over_content(self, monkeypatch):
+        """When both 'entry' and the 'content' alias are supplied, 'entry' wins
+        and the alias is dropped.
+        """
+        from mempalace import mcp_server
+
+        captured = {}
+
+        def capture(**kwargs):
+            captured.update(kwargs)
+            return {"success": True}
+
+        monkeypatch.setitem(mcp_server.TOOLS["mempalace_diary_write"], "handler", capture)
+        resp = mcp_server.handle_request(
+            {
+                "method": "tools/call",
+                "id": 6,
+                "params": {
+                    "name": "mempalace_diary_write",
+                    "arguments": {"agent_name": "t", "entry": "real", "content": "alias"},
+                },
+            }
+        )
+        assert "error" not in resp
+        assert captured.get("entry") == "real"
+        assert "content" not in captured
+
     def test_handler_internal_signature_shape_stays_generic(self, monkeypatch):
         """A TypeError whose function name does not match the dispatched
         handler — e.g. raised by a helper called inside the handler body —
