@@ -1,0 +1,102 @@
+name: Publish to PyPI
+
+# Publishes mempalace to PyPI via Trusted Publishing (OIDC — no stored token).
+#
+# Trigger: a GitHub Release is *published* (not merely drafted). The release may
+# create the `v*` tag or be cut from an existing one — either way the checks
+# below run here on purpose, so this pipeline is self-contained and never
+# uploads a tag that isn't on main or doesn't match the version manifest.
+#
+# One-time setup required before the first run (see docs/RELEASING.md):
+#   1. PyPI → Manage project `mempalace` → Publishing → Add a trusted publisher:
+#        Owner: MemPalace   Repository: mempalace
+#        Workflow: publish.yml   Environment: pypi
+#   2. GitHub → repo Settings → Environments → New environment `pypi`,
+#      add yourself as a Required reviewer (this is the manual approval gate).
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build + pre-publish checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # No explicit ref: on a release event the default checkout is already
+          # the release tag's commit (github.ref = refs/tags/<tag>). This avoids
+          # interpolating the event-controlled tag_name into a checkout ref
+          # (ref-injection). fetch-depth: 0 gives the ancestry check full history.
+          fetch-depth: 0
+
+      - name: Verify the release tag is on main
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          tag_sha=$(git rev-parse HEAD)  # the checked-out release tag commit
+          main_sha=$(git rev-parse FETCH_HEAD)
+          if git merge-base --is-ancestor "$tag_sha" "$main_sha"; then
+            echo "Tag $TAG ($tag_sha) is reachable from main — OK."
+          else
+            echo "::error::Release tag $TAG is not an ancestor of main. Releases must be cut from main."
+            exit 1
+          fi
+
+      - name: Verify the tag matches the version manifest
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          # version.py is the source of truth (per CLAUDE.md); version-guard.yml
+          # separately enforces that pyproject + the three plugin manifests agree.
+          py_version=$(grep -E '^__version__' mempalace/version.py | cut -d'"' -f2)
+          tag_version="${TAG#v}"
+          if [[ "$tag_version" != "$py_version" ]]; then
+            echo "::error::tag $TAG does not match mempalace/version.py ($py_version). Bump the version files before releasing."
+            exit 1
+          fi
+          echo "Tag $TAG matches manifest version $py_version — OK."
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Build sdist + wheel
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    # Binds the upload to the protected `pypi` environment — the run pauses here
+    # until a required reviewer approves. This is also where the OIDC trust is
+    # scoped on the PyPI side.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/mempalace
+    permissions:
+      id-token: write  # mint the short-lived OIDC token for Trusted Publishing
+    steps:
+      - name: Download dist artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
