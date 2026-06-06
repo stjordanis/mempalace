@@ -499,12 +499,13 @@ class _PgVectorClient:
         return bool(rows)
 
     def table_dimension(self, table: str) -> Optional[int]:
-        # The raw ``atttypmod`` of a ``vector(n)`` column is NOT the bare
-        # dimension (pgvector encodes it via its own typmod_in), so reading it
-        # directly can be off and produce false DimensionMismatchErrors on
-        # reopen. Round-trip through ``format_type`` instead, which invokes the
-        # type's own typmod_out and yields the canonical ``vector(384)`` text
-        # regardless of the internal encoding or pgvector version.
+        # Read the declared dimension via ``format_type`` (which invokes the
+        # type's own typmod_out and yields canonical ``vector(384)`` text)
+        # rather than the raw ``atttypmod``. On the pgvector versions tested
+        # (0.8.x) atttypmod already equals the bare dimension, so the direct
+        # read also worked — but format_type is the canonical, version-proof
+        # source of truth and avoids depending on the internal typmod encoding
+        # staying stable across pgvector releases.
         try:
             rows = self._execute(
                 "SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a "
