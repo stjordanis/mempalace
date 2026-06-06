@@ -16,13 +16,28 @@ class _FakeInner:
         self.calls = {}
 
     def add(self, *, documents, ids, metadatas=None, embeddings=None):
-        self.calls["add"] = {"documents": documents, "ids": ids, "embeddings": embeddings}
+        self.calls["add"] = {
+            "documents": documents,
+            "ids": ids,
+            "metadatas": metadatas,
+            "embeddings": embeddings,
+        }
 
     def upsert(self, *, documents, ids, metadatas=None, embeddings=None):
-        self.calls["upsert"] = {"documents": documents, "ids": ids, "embeddings": embeddings}
+        self.calls["upsert"] = {
+            "documents": documents,
+            "ids": ids,
+            "metadatas": metadatas,
+            "embeddings": embeddings,
+        }
 
     def update(self, *, ids, documents=None, metadatas=None, embeddings=None):
-        self.calls["update"] = {"documents": documents, "ids": ids, "embeddings": embeddings}
+        self.calls["update"] = {
+            "documents": documents,
+            "ids": ids,
+            "metadatas": metadatas,
+            "embeddings": embeddings,
+        }
 
     def query(self, *, query_texts=None, query_embeddings=None, **_kw):
         self.calls["query"] = {"query_texts": query_texts, "query_embeddings": query_embeddings}
@@ -45,7 +60,10 @@ def _patch_embed(monkeypatch):
 
 def test_as_list_wraps_bare_string():
     assert ew._as_list("hello world") == ["hello world"]
-    assert ew._as_list(["a", "b"]) == ["a", "b"]
+    assert ew._as_list({"k": 1}) == [{"k": 1}]  # bare dict wrapped, not -> ["k"]
+    src = ["a", "b"]
+    assert ew._as_list(src) is src  # list returned as-is (no copy)
+    assert ew._as_list(("a", "b")) == ["a", "b"]  # other iterables materialized
 
 
 def test_add_wraps_bare_string_document(monkeypatch):
@@ -93,3 +111,16 @@ def test_list_inputs_unaffected(monkeypatch):
     ew.EmbeddingCollection(inner).add(documents=["one", "two"], ids=["a", "b"])
     assert seen["texts"] == ["one", "two"]
     assert len(inner.calls["add"]["embeddings"]) == 2
+
+
+def test_add_wraps_bare_string_ids_and_dict_metadatas(monkeypatch):
+    _patch_embed(monkeypatch)
+    inner = _FakeInner()
+    # a single id (str) and a single metadata (dict) are OneOrMany shapes too
+    ew.EmbeddingCollection(inner).add(documents="solo", ids="d1", metadatas={"src": "web"})
+    call = inner.calls["add"]
+    assert call["ids"] == ["d1"]  # not ['d', '1']
+    assert call["metadatas"] == [{"src": "web"}]  # not ['src']
+    # documents / embeddings / ids / metadatas all length-aligned at 1
+    assert call["documents"] == ["solo"]
+    assert len(call["embeddings"]) == 1
