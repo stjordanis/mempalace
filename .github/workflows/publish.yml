@@ -10,8 +10,12 @@ name: Publish to PyPI
 #     so this lets a maintainer run the publish for any existing tag from the
 #     Actions tab ("Run workflow" → enter the tag, e.g. v3.4.0).
 #
-# Either way the checks below run on purpose, so this pipeline is self-contained
-# and never uploads a tag that isn't on main or doesn't match the version manifest.
+# Build + publish run in ONE job on purpose: a two-job split hands the wheel
+# between jobs via upload/download-artifact, which failed repeatedly with
+# `BlobNotFound` on the same-run download. Building and publishing in the same
+# job removes that handoff entirely. The job is gated by the `pypi` environment
+# (manual approval), and the checks below keep it self-contained — it never
+# uploads a tag that isn't on main or doesn't match the version manifest.
 #
 # One-time setup required before the first run (see docs/RELEASING.md):
 #   1. PyPI → Manage project `mempalace` → Publishing → Add a trusted publisher:
@@ -34,9 +38,17 @@ permissions:
   contents: read
 
 jobs:
-  build:
-    name: Build + pre-publish checks
+  publish:
+    name: Build + publish to PyPI
     runs-on: ubuntu-latest
+    # The `pypi` environment gate (required reviewer) pauses the whole job until
+    # approved, and scopes the OIDC trust on the PyPI side.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/mempalace
+    permissions:
+      contents: read # checkout
+      id-token: write # mint the short-lived OIDC token for Trusted Publishing
     steps:
       - name: Resolve the release tag
         id: tag
@@ -107,31 +119,6 @@ jobs:
         run: |
           python -m pip install --upgrade build
           python -m build
-
-      - name: Upload dist artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: dist
-          path: dist/
-
-  publish:
-    name: Publish to PyPI
-    needs: build
-    runs-on: ubuntu-latest
-    # Binds the upload to the protected `pypi` environment — the run pauses here
-    # until a required reviewer approves. This is also where the OIDC trust is
-    # scoped on the PyPI side.
-    environment:
-      name: pypi
-      url: https://pypi.org/p/mempalace
-    permissions:
-      id-token: write # mint the short-lived OIDC token for Trusted Publishing
-    steps:
-      - name: Download dist artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: dist
-          path: dist/
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
