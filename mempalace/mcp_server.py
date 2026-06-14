@@ -1390,6 +1390,250 @@ def tool_follow_tunnels(wing: str, room: str):
 # ==================== WRITE TOOLS ====================
 
 
+def _chroma_field(result, name, default=None):
+    if result is None:
+        return default
+    if isinstance(result, dict):
+        return result.get(name, default)
+    return getattr(result, name, default)
+
+
+def _chunk_index(meta):
+    try:
+        return int((meta or {}).get("chunk_index", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _response_safe_meta(meta):
+    safe_meta = _safe_meta(meta)
+    if safe_meta.get("source_file"):
+        safe_meta["source_file"] = Path(safe_meta["source_file"]).name
+    return safe_meta
+
+
+def _content_preview(content):
+    return content[:200] + "..." if len(content) > 200 else content
+
+
+def _single_drawer_record(col, drawer_id: str):
+    result = col.get(ids=[drawer_id], include=["documents", "metadatas"])
+    ids = _chroma_field(result, "ids", []) or []
+    if not ids:
+        return None
+
+    docs = _chroma_field(result, "documents", []) or []
+    metas = _chroma_field(result, "metadatas", []) or []
+    doc = docs[0] if docs else ""
+    meta = _safe_meta(metas[0] if metas else {})
+
+    return {
+        "drawer_id": ids[0],
+        "ids": [ids[0]],
+        "documents": [doc or ""],
+        "metadatas": [meta],
+        "content": doc or "",
+        "metadata": meta,
+        "chunked": False,
+    }
+
+
+def _logical_chunk_group(col, drawer_id: str):
+    try:
+        result = col.get(
+            where={"parent_drawer_id": drawer_id},
+            include=["documents", "metadatas"],
+        )
+    except Exception:
+        logger.debug("chunk group lookup failed for %s", drawer_id, exc_info=True)
+        return None
+
+    ids = _chroma_field(result, "ids", []) or []
+    if not ids:
+        return None
+
+    docs = _chroma_field(result, "documents", []) or []
+    metas = _chroma_field(result, "metadatas", []) or []
+
+    rows = []
+    for idx, chunk_id in enumerate(ids):
+        doc = docs[idx] if idx < len(docs) else ""
+        meta = _safe_meta(metas[idx] if idx < len(metas) else {})
+        rows.append((_chunk_index(meta), chunk_id, doc or "", meta))
+
+    rows.sort(key=lambda row: (row[0], row[1]))
+
+    chunk_ids = [row[1] for row in rows]
+    chunk_docs = [row[2] for row in rows]
+    chunk_metas = [row[3] for row in rows]
+    first_meta = chunk_metas[0] if chunk_metas else {}
+
+    return {
+        "drawer_id": drawer_id,
+        "ids": chunk_ids,
+        "documents": chunk_docs,
+        "metadatas": chunk_metas,
+        "content": "".join(chunk_docs),
+        "metadata": first_meta,
+        "chunked": True,
+    }
+
+
+def _logical_drawer_record(col, drawer_id: str):
+    direct = _single_drawer_record(col, drawer_id)
+    if direct is not None:
+        return direct
+    return _logical_chunk_group(col, drawer_id)
+
+
+def _drawer_payload(record):
+    safe_meta = _response_safe_meta(record["metadata"])
+
+    payload = {
+        "drawer_id": record["drawer_id"],
+        "content": record["content"],
+        "wing": safe_meta.get("wing", ""),
+        "room": safe_meta.get("room", ""),
+        "metadata": safe_meta,
+    }
+
+    if record.get("chunked"):
+        payload["chunks"] = len(record["ids"])
+        payload["chunk_ids"] = record["ids"]
+        payload["metadata"]["chunks"] = len(record["ids"])
+        payload["metadata"]["chunk_ids"] = record["ids"]
+
+    return payload
+
+
+def _fetch_drawer_rows(col, where=None, page_size: int = 1000):
+    ids = []
+    documents = []
+    metadatas = []
+    offset = 0
+
+    while True:
+        kwargs = {
+            "include": ["documents", "metadatas"],
+            "limit": page_size,
+            "offset": offset,
+        }
+        if where:
+            kwargs["where"] = where
+
+        result = col.get(**kwargs)
+        batch_ids = _chroma_field(result, "ids", []) or []
+        if not batch_ids:
+            break
+
+        batch_docs = _chroma_field(result, "documents", []) or []
+        batch_metas = _chroma_field(result, "metadatas", []) or []
+
+        ids.extend(batch_ids)
+
+        for idx in range(len(batch_ids)):
+            documents.append(batch_docs[idx] if idx < len(batch_docs) else "")
+            metadatas.append(batch_metas[idx] if idx < len(batch_metas) else {})
+
+        offset += len(batch_ids)
+        if len(batch_ids) < page_size:
+            break
+
+    return ids, documents, metadatas
+
+
+def _collapse_drawer_rows(ids, documents, metadatas):
+    groups = {}
+    singles = []
+
+    for idx, drawer_id in enumerate(ids):
+        doc = documents[idx] if idx < len(documents) else ""
+        meta = _safe_meta(metadatas[idx] if idx < len(metadatas) else {})
+        parent_id = meta.get("parent_drawer_id")
+
+        if parent_id:
+            groups.setdefault(parent_id, []).append(
+                (_chunk_index(meta), drawer_id, doc or "", meta)
+            )
+        else:
+            singles.append((drawer_id, doc or "", meta))
+
+    grouped_ids = set(groups)
+    drawers = []
+
+    for drawer_id, doc, meta in singles:
+        # If both a legacy logical row and chunks exist, display one logical row.
+        if drawer_id in grouped_ids:
+            continue
+
+        safe_meta = _response_safe_meta(meta)
+        drawers.append(
+            {
+                "drawer_id": drawer_id,
+                "wing": safe_meta.get("wing", ""),
+                "room": safe_meta.get("room", ""),
+                "content_preview": _content_preview(doc),
+                "metadata": safe_meta,
+            }
+        )
+
+    for parent_id, parts in groups.items():
+        parts.sort(key=lambda row: (row[0], row[1]))
+        chunk_ids = [row[1] for row in parts]
+        content = "".join(row[2] for row in parts)
+
+        safe_meta = _response_safe_meta(parts[0][3] if parts else {})
+        safe_meta["chunks"] = len(chunk_ids)
+        safe_meta["chunk_ids"] = chunk_ids
+
+        drawers.append(
+            {
+                "drawer_id": parent_id,
+                "wing": safe_meta.get("wing", ""),
+                "room": safe_meta.get("room", ""),
+                "content_preview": _content_preview(content),
+                "metadata": safe_meta,
+                "chunks": len(chunk_ids),
+                "chunk_ids": chunk_ids,
+            }
+        )
+
+    drawers.sort(key=lambda item: item["drawer_id"])
+    return drawers
+
+
+def _build_chunk_rows(drawer_id: str, content: str, meta: dict, chunk_size: int):
+    chunk_size = max(1, int(chunk_size or 1))
+
+    base_meta = _safe_meta(meta)
+    base_meta.pop("chunk_index", None)
+    base_meta["parent_drawer_id"] = drawer_id
+
+    spans = (
+        [(0, "")]
+        if content == ""
+        else [
+            (start, content[start : start + chunk_size])
+            for start in range(0, len(content), chunk_size)
+        ]
+    )
+
+    chunk_ids = []
+    chunk_docs = []
+    chunk_metas = []
+
+    for start, chunk_doc in spans:
+        chunk_index = start // chunk_size
+        chunk_ids.append(f"{drawer_id}_chunk_{chunk_index:06d}")
+        chunk_docs.append(chunk_doc)
+
+        chunk_meta = dict(base_meta)
+        chunk_meta["chunk_index"] = chunk_index
+        chunk_metas.append(chunk_meta)
+
+    return chunk_ids, chunk_docs, chunk_metas
+
+
 def tool_add_drawer(
     wing: str, room: str, content: str, source_file: str = None, added_by: str = "mcp"
 ):
@@ -1528,34 +1772,39 @@ def tool_add_drawer(
 
 
 def tool_delete_drawer(drawer_id: str):
-    """Delete a single drawer by ID."""
+    """Delete a single logical drawer by ID."""
     global _metadata_cache
+
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
-    existing = col.get(ids=[drawer_id])
-    if not existing["ids"]:
-        return {"success": False, "error": f"Drawer not found: {drawer_id}"}
-
-    # Log the deletion with the content being removed for audit trail
-    deleted_content = existing.get("documents", [""])[0] if existing.get("documents") else ""
-    deleted_meta = _safe_meta(
-        existing.get("metadatas", [{}])[0] if existing.get("metadatas") else {}
-    )
-    _wal_log(
-        "delete_drawer",
-        {
-            "drawer_id": drawer_id,
-            "deleted_meta": deleted_meta,
-            "content_preview": deleted_content[:200],
-        },
-    )
 
     try:
-        col.delete(ids=[drawer_id])
+        record = _logical_drawer_record(col, drawer_id)
+        if record is None:
+            return {"success": False, "error": f"Drawer not found: {drawer_id}"}
+
+        _wal_log(
+            "delete_drawer",
+            {
+                "drawer_id": drawer_id,
+                "deleted_ids": record["ids"],
+                "deleted_meta": record["metadata"],
+                "content_preview": record["content"][:200],
+            },
+        )
+
+        col.delete(ids=record["ids"])
         _metadata_cache = None
-        logger.info(f"Deleted drawer: {drawer_id}")
-        return {"success": True, "drawer_id": drawer_id}
+
+        logger.info("Deleted drawer: %s (%s rows)", drawer_id, len(record["ids"]))
+
+        return {
+            "success": True,
+            "drawer_id": drawer_id,
+            "deleted_ids": record["ids"],
+            "chunks_deleted": len(record["ids"]),
+        }
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -1806,88 +2055,57 @@ def tool_sync(project_dir: str = None, wing: str = None, apply: bool = False):
 
 
 def tool_get_drawer(drawer_id: str):
-    """Fetch a single drawer by ID. Returns full content and metadata."""
+    """Fetch a single logical drawer by ID."""
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
+
     try:
-        result = col.get(ids=[drawer_id], include=["documents", "metadatas"])
-        if not result["ids"]:
+        record = _logical_drawer_record(col, drawer_id)
+        if record is None:
             return {"error": f"Drawer not found: {drawer_id}"}
-        meta = _safe_meta(result["metadatas"][0])
-        doc = result["documents"][0]
-        # source_file is the absolute filesystem path written by the
-        # miners. Reduce to its basename before handing it to the MCP
-        # client — same threat model as the palace_path leak fix:
-        # nested-agent / multi-server topologies treat the client as a
-        # separate trust domain. Basename preserves citation utility.
-        # Mirrors the searcher.search_memories() return shape.
-        safe_meta = dict(meta) if meta else {}
-        if safe_meta.get("source_file"):
-            safe_meta["source_file"] = Path(safe_meta["source_file"]).name
-        return {
-            "drawer_id": drawer_id,
-            "content": doc,
-            "wing": safe_meta.get("wing", ""),
-            "room": safe_meta.get("room", ""),
-            "metadata": safe_meta,
-        }
+        return _drawer_payload(record)
     except Exception as e:
         return {"error": str(e)}
 
 
 def tool_list_drawers(wing: str = None, room: str = None, limit: int = 20, offset: int = 0):
-    """List drawers with pagination. Optional wing/room filter."""
+    """List logical drawers with pagination."""
     limit = max(1, min(limit, _MAX_RESULTS))
     offset = max(0, offset)
+
     try:
         wing = _sanitize_optional_name(wing, "wing")
         room = _sanitize_optional_name(room, "room")
     except ValueError as e:
         return {"error": str(e)}
+
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
+
     try:
         where = None
         conditions = []
+
         if wing:
             conditions.append({"wing": wing})
         if room:
             conditions.append({"room": room})
+
         if len(conditions) == 1:
             where = conditions[0]
         elif len(conditions) > 1:
             where = {"$and": conditions}
 
-        kwargs = {"include": ["documents", "metadatas"], "limit": limit, "offset": offset}
-        if where:
-            kwargs["where"] = where
-        result = col.get(**kwargs)
+        ids, documents, metadatas = _fetch_drawer_rows(col, where=where)
+        drawers = _collapse_drawer_rows(ids, documents, metadatas)
+        page = drawers[offset : offset + limit]
 
-        # Compute total matching drawers for pagination.
-        if where:
-            total_result = col.get(where=where, include=[])
-            total = len(total_result["ids"])
-        else:
-            total = col.count()
-
-        drawers = []
-        for i, did in enumerate(result["ids"]):
-            meta = _safe_meta(result["metadatas"][i])
-            doc = result["documents"][i]
-            drawers.append(
-                {
-                    "drawer_id": did,
-                    "wing": meta.get("wing", ""),
-                    "room": meta.get("room", ""),
-                    "content_preview": doc[:200] + "..." if len(doc) > 200 else doc,
-                }
-            )
         return {
-            "drawers": drawers,
-            "total": total,
-            "count": len(drawers),
+            "drawers": page,
+            "total": len(drawers),
+            "count": len(page),
             "offset": offset,
             "limit": limit,
         }
@@ -1896,7 +2114,7 @@ def tool_list_drawers(wing: str = None, room: str = None, limit: int = 20, offse
 
 
 def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, room: str = None):
-    """Update an existing drawer's content and/or metadata."""
+    """Update an existing logical drawer's content and/or metadata."""
     global _metadata_cache
 
     if content is None and wing is None and room is None:
@@ -1905,13 +2123,14 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
     col = _get_collection()
     if not col:
         return _collection_error_or_no_palace()
+
     try:
-        existing = col.get(ids=[drawer_id], include=["documents", "metadatas"])
-        if not existing["ids"]:
+        record = _logical_drawer_record(col, drawer_id)
+        if record is None:
             return {"success": False, "error": f"Drawer not found: {drawer_id}"}
 
-        old_meta = _safe_meta(existing["metadatas"][0])
-        old_doc = existing["documents"][0]
+        old_meta = _safe_meta(record["metadata"])
+        old_doc = record["content"]
 
         new_doc = old_doc
         if content is not None:
@@ -1921,22 +2140,20 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
                 return {"success": False, "error": str(e)}
 
         new_meta = dict(old_meta)
+
         if wing is not None:
             try:
                 wing = sanitize_name(wing, "wing")
             except ValueError as e:
                 return {"success": False, "error": str(e)}
-            # Preserve existing casing when the caller passes a case-only
-            # variant (LLM clients often "autocorrect" acronyms like ps5→PS5).
             if wing.lower() != str(old_meta.get("wing") or "").lower():
                 new_meta["wing"] = wing
+
         if room is not None:
             try:
                 room = sanitize_name(room, "room")
             except ValueError as e:
                 return {"success": False, "error": str(e)}
-            # Preserve existing casing when the caller passes a case-only
-            # variant (LLM clients often "autocorrect" acronyms like ps5→PS5).
             if room.lower() != str(old_meta.get("room") or "").lower():
                 new_meta["room"] = room
 
@@ -1953,15 +2170,47 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
             },
         )
 
-        update_kwargs = {"ids": [drawer_id]}
+        chunk_size = max(1, int(getattr(_config, "chunk_size", 800) or 800))
+        should_chunk = bool(record.get("chunked")) or len(new_doc) > chunk_size
+
+        if should_chunk:
+            chunk_ids, chunk_docs, chunk_metas = _build_chunk_rows(
+                drawer_id,
+                new_doc,
+                new_meta,
+                chunk_size,
+            )
+
+            col.upsert(ids=chunk_ids, documents=chunk_docs, metadatas=chunk_metas)
+
+            keep_ids = set(chunk_ids)
+            stale_ids = [old_id for old_id in record["ids"] if old_id not in keep_ids]
+            if stale_ids:
+                col.delete(ids=stale_ids)
+
+            _metadata_cache = None
+
+            logger.info("Updated drawer: %s (%s rows)", drawer_id, len(chunk_ids))
+
+            return {
+                "success": True,
+                "drawer_id": drawer_id,
+                "wing": new_meta.get("wing", ""),
+                "room": new_meta.get("room", ""),
+                "chunks": len(chunk_ids),
+                "chunk_ids": chunk_ids,
+            }
+
+        update_kwargs = {"ids": [record["ids"][0]]}
         if content is not None:
             update_kwargs["documents"] = [new_doc]
         update_kwargs["metadatas"] = [new_meta]
-        col.update(**update_kwargs)
 
+        col.update(**update_kwargs)
         _metadata_cache = None
 
-        logger.info(f"Updated drawer: {drawer_id}")
+        logger.info("Updated drawer: %s", drawer_id)
+
         return {
             "success": True,
             "drawer_id": drawer_id,

@@ -1736,35 +1736,88 @@ class TestWriteTools:
         assert result["chunks"] == 1
         assert "chunk_ids" not in result
 
-    def test_add_drawer_chunked_logical_id_not_fetchable_directly(
-        self, monkeypatch, config, palace_path, kg
-    ):
-        """Documented contract on the chunked path: ``tool_get_drawer``
-        and ``tool_delete_drawer`` against the returned logical
-        ``drawer_id`` report ``not found`` because no row is stored
-        under that id. Callers must iterate ``chunk_ids`` or query by
-        ``parent_drawer_id`` metadata."""
-        _patch_mcp_server(monkeypatch, config, kg)
-        _client, _col = _get_collection(palace_path, create=True)
-        del _client
-        from mempalace.mcp_server import tool_add_drawer, tool_delete_drawer, tool_get_drawer
 
-        result = tool_add_drawer(wing="w", room="r", content="P" * 4000)
-        assert result["success"] is True and result["chunks"] > 1
+def test_add_drawer_chunked_logical_id_fetches_deletes_and_lists_as_one(
+    monkeypatch, config, palace_path, kg
+):
+    """Chunk rows are internal storage; MCP tools operate on the logical id."""
+    _patch_mcp_server(monkeypatch, config, kg)
+    _client, _col = _get_collection(palace_path, create=True)
+    del _client
 
-        # tool_get_drawer against logical id: not found.
-        got_logical = tool_get_drawer(result["drawer_id"])
-        assert "error" in got_logical and "not found" in got_logical["error"].lower()
+    from mempalace.mcp_server import (
+        tool_add_drawer,
+        tool_delete_drawer,
+        tool_get_drawer,
+        tool_list_drawers,
+    )
 
-        # tool_get_drawer against the first chunk id: found, full content slice.
-        got_chunk = tool_get_drawer(result["chunk_ids"][0])
-        assert got_chunk["content"] == "P" * config.chunk_size
-        assert got_chunk["metadata"]["parent_drawer_id"] == result["drawer_id"]
+    result = tool_add_drawer(wing="w", room="r", content="P" * 4000)
 
-        # tool_delete_drawer against logical id: also not found.
-        deleted_logical = tool_delete_drawer(result["drawer_id"])
-        assert deleted_logical["success"] is False
-        assert "not found" in deleted_logical["error"].lower()
+    assert result["success"] is True
+    assert result["chunks"] > 1
+
+    logical_id = result["drawer_id"]
+
+    fetched = tool_get_drawer(logical_id)
+    assert fetched["drawer_id"] == logical_id
+    assert fetched["content"] == "P" * 4000
+    assert fetched["chunks"] == result["chunks"]
+    assert fetched["chunk_ids"] == result["chunk_ids"]
+
+    listed = tool_list_drawers(wing="w", room="r")
+    assert listed["total"] == 1
+    assert listed["count"] == 1
+    assert listed["drawers"][0]["drawer_id"] == logical_id
+    assert listed["drawers"][0]["chunks"] == result["chunks"]
+
+    deleted = tool_delete_drawer(logical_id)
+    assert deleted["success"] is True
+    assert deleted["chunks_deleted"] == result["chunks"]
+
+    missing = tool_get_drawer(logical_id)
+    assert "error" in missing
+    assert "not found" in missing["error"].lower()
+
+
+def test_update_drawer_chunked_logical_id_rewrites_group(monkeypatch, config, palace_path, kg):
+    """Updating the returned logical id rewrites the underlying chunk group."""
+    _patch_mcp_server(monkeypatch, config, kg)
+    _client, _col = _get_collection(palace_path, create=True)
+    del _client
+
+    from mempalace.mcp_server import (
+        tool_add_drawer,
+        tool_get_drawer,
+        tool_list_drawers,
+        tool_update_drawer,
+    )
+
+    result = tool_add_drawer(wing="old", room="old_room", content="A" * 2600)
+    assert result["success"] is True
+    assert result["chunks"] > 1
+
+    logical_id = result["drawer_id"]
+
+    updated = tool_update_drawer(
+        logical_id,
+        content="B" * 1800,
+        wing="new",
+        room="new_room",
+    )
+
+    assert updated["success"] is True
+    assert updated["drawer_id"] == logical_id
+
+    fetched = tool_get_drawer(logical_id)
+    assert fetched["drawer_id"] == logical_id
+    assert fetched["content"] == "B" * 1800
+    assert fetched["wing"] == "new"
+    assert fetched["room"] == "new_room"
+
+    listed = tool_list_drawers(wing="new", room="new_room")
+    assert listed["total"] == 1
+    assert listed["drawers"][0]["drawer_id"] == logical_id
 
 
 # ── KG Tools ────────────────────────────────────────────────────────────
