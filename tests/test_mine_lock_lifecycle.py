@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import mempalace.palace as palace_module
 from mempalace.palace import (
     _lock_mine_lock_file,
     _mine_lock_path,
@@ -22,12 +23,20 @@ def _set_home(monkeypatch, tmp_path: Path) -> None:
 
 
 def _wait_for_path(path: Path, timeout: float = 10.0) -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         if path.exists():
             return True
         time.sleep(0.01)
     return path.exists()
+
+
+def _assert_path_absent_for(path: Path, duration: float = 0.5) -> None:
+    deadline = time.monotonic() + duration
+    while time.monotonic() < deadline:
+        assert not path.exists(), "waiter entered while replacement lock was held"
+        time.sleep(0.01)
+    assert not path.exists(), "waiter entered while replacement lock was held"
 
 
 def _stale_waiter_target(
@@ -59,6 +68,7 @@ def _stale_waiter_target(
             return
 
         lf.close()
+        result_q.put(("retrying", True))
         with public_mine_lock(source_file):
             Path(entered_flag).touch()
             _wait_for_path(Path(release_flag))
@@ -81,6 +91,61 @@ def test_mine_lock_removes_uncontended_lock_file(tmp_path, monkeypatch):
         assert lock_path.exists()
 
     assert not lock_path.exists()
+
+
+def test_mine_lock_close_failure_still_runs_cleanup(monkeypatch):
+    events = []
+
+    class FakeLock:
+        def close(self):
+            events.append("close")
+            raise OSError("close failed")
+
+    fake_lock = FakeLock()
+    monkeypatch.setattr(palace_module, "_mine_lock_path", lambda source_file: "source.lock")
+    monkeypatch.setattr(palace_module, "_acquire_mine_lock_file", lambda lock_path: fake_lock)
+    monkeypatch.setattr(
+        palace_module, "_unlock_mine_lock_file", lambda lock_file: events.append("unlock")
+    )
+    monkeypatch.setattr(
+        palace_module,
+        "_cleanup_mine_lock_file",
+        lambda lock_path: events.append(("cleanup", lock_path)),
+    )
+
+    with palace_module.mine_lock("source.txt"):
+        events.append("body")
+
+    assert events == ["body", "unlock", "close", ("cleanup", "source.lock")]
+
+
+def test_windows_cleanup_release_failure_does_not_retry_unlock(monkeypatch):
+    events = []
+
+    class FakeLock:
+        def close(self):
+            events.append("close")
+
+    fake_lock = FakeLock()
+
+    monkeypatch.setattr(palace_module.os, "name", "nt", raising=False)
+    monkeypatch.setattr(
+        palace_module, "_open_mine_lock_file", lambda lock_path, *, create: fake_lock
+    )
+    monkeypatch.setattr(palace_module, "_lock_mine_lock_file", lambda lock_file, *, blocking: True)
+    monkeypatch.setattr(
+        palace_module, "_mine_lock_file_is_current", lambda lock_file, lock_path: True
+    )
+
+    def fail_unlock(lock_file):
+        events.append("unlock")
+        raise OSError("unlock failed")
+
+    monkeypatch.setattr(palace_module, "_unlock_mine_lock_file", fail_unlock)
+
+    palace_module._cleanup_mine_lock_file("source.lock")
+
+    assert events == ["unlock", "close"]
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX inode replacement regression")
@@ -129,8 +194,8 @@ def test_mine_lock_retries_when_waiter_wakes_on_unlinked_inode(tmp_path, monkeyp
         old_lf = None
 
         assert result_q.get(timeout=10) == ("first-acquire-current", False)
-        time.sleep(0.2)
-        assert not entered_flag.exists(), "waiter entered while replacement lock was held"
+        assert result_q.get(timeout=10) == ("retrying", True)
+        _assert_path_absent_for(entered_flag)
 
         _unlock_mine_lock_file(replacement_lf)
         replacement_lf.close()

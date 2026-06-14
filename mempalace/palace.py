@@ -734,8 +734,10 @@ def mine_lock(source_file: str):
             _unlock_mine_lock_file(lf)
         except Exception:
             logger.debug("Mine-lock release failed", exc_info=True)
-        finally:
+        try:
             lf.close()
+        except Exception:
+            logger.debug("Mine-lock close failed", exc_info=True)
         _cleanup_mine_lock_file(lock_path)
 
 
@@ -875,6 +877,7 @@ def _cleanup_mine_lock_file(lock_path: str) -> None:
                 _unlock_mine_lock_file(lf)
             except Exception:
                 logger.debug("Mine-lock cleanup release failed", exc_info=True)
+                acquired = False
                 return
             acquired = False
             lf.close()
