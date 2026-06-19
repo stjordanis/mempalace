@@ -74,7 +74,7 @@ sqlite_exact = "mempalace.backends.sqlite_exact:SQLiteExactBackend"
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
-    "ruff==0.15.15",
+    "ruff==0.15.18",
     "psutil>=5.9",
     # Property-based testing — generates hundreds of random inputs per
     # test to find counterexamples the hand-written positive tests miss.
@@ -131,7 +131,7 @@ extract = [
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
-    "ruff==0.15.15",
+    "ruff==0.15.18",
     "psutil>=5.9",
     "hypothesis>=6.0",
     "pre-commit>=3.0",
