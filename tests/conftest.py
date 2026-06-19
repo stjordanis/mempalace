@@ -12,7 +12,6 @@ instead of the real user profile.
 
 import os
 import shutil
-import sys
 import tempfile
 
 # ── Isolate HOME before any mempalace imports ──────────────────────────
@@ -118,33 +117,6 @@ def _isolate_home():
         else:
             os.environ[var] = orig
     shutil.rmtree(_session_tmp, ignore_errors=True)
-
-
-# Windows-only diagnostic for the process-exit hang (a non-daemon thread
-# blocked on a socket outlives the test session). Tests pass (666) then the
-# interpreter blocks at shutdown until CI sends SIGINT. dump_traceback_later
-# fires a watchdog that prints every thread's stack to stderr once the hang
-# has run a while, so the culprit thread is visible in the log. Gated to
-# win32 so green platforms see no extra output. Remove once the hang is fixed.
-if sys.platform == "win32":
-    import faulthandler as _faulthandler
-    import threading as _threading
-
-    @pytest.fixture(scope="session", autouse=True)
-    def _diag_win_exit_hang():
-        _faulthandler.dump_traceback_later(130, exit=False, file=sys.stderr)
-
-        yield
-
-        # Snapshot every live thread right after the tests finish. A non-daemon
-        # thread present here is what blocks interpreter shutdown.
-        print("--- alive threads at session teardown ---", file=sys.stderr, flush=True)
-        for t in _threading.enumerate():
-            print(
-                f"thread name={t.name!r} daemon={t.daemon} alive={t.is_alive()} ident={t.ident}",
-                file=sys.stderr,
-                flush=True,
-            )
 
 
 @pytest.fixture

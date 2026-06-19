@@ -7,6 +7,15 @@ import pytest
 from mempalace import daemon
 from mempalace import service
 
+# POSIX file-mode bits (0600/0700) are not representable on Windows: os.chmod
+# can only toggle the read-only attribute, so a "private" file still reports
+# 0o666. The daemon relies on the user-profile directory ACLs for privacy
+# there, so the owner-only assertions only make sense on POSIX.
+_posix_only_perms = pytest.mark.skipif(
+    os.name == "nt",
+    reason="POSIX 0600/0700 file-mode bits are not representable on Windows (ACL-based privacy)",
+)
+
 # Env keys run_server mutates from its background thread, plus umask. If a
 # lifecycle test times out before the server comes up, run_server's finally
 # never runs and those mutations leak into the rest of the suite — every later
@@ -226,20 +235,35 @@ def _start_server(tmp_path, monkeypatch, execute_fn):
     palace.mkdir()
     monkeypatch.setattr(service, "execute_job", execute_fn)
     holders = _capture_httpd(monkeypatch)
-    thread = threading.Thread(
-        target=daemon.run_server,
-        kwargs={"palace_path": str(palace), "port": 0},
-        daemon=True,
-    )
+
+    # Capture any exception run_server raises in its thread. Without this a
+    # startup crash is invisible: the poll below would just spin for 30s and
+    # fail with a bare ``assert client is not None`` giving no cause.
+    server_error: list = []
+
+    def _serve():
+        try:
+            daemon.run_server(palace_path=str(palace), port=0)
+        except BaseException as exc:  # noqa: BLE001 - re-surfaced to the test thread
+            server_error.append(exc)
+
+    thread = threading.Thread(target=_serve, name="test-daemon-server", daemon=True)
     thread.start()
     client = None
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
+        if server_error:
+            raise AssertionError(f"run_server crashed during startup: {server_error[0]!r}")
         client = daemon.get_client_if_running(str(palace))
         if client is not None:
             break
         time.sleep(0.05)
-    assert client is not None
+    if client is None:
+        raise AssertionError(
+            "daemon did not become ready within 30s "
+            f"(thread_alive={thread.is_alive()}, httpd_bound={bool(holders)}, "
+            f"endpoint_exists={daemon.endpoint_path(str(palace)).exists()})"
+        )
     return client, thread, palace, holders
 
 
@@ -356,6 +380,7 @@ def test_claim_next_does_not_reclaim_running_job(tmp_path, monkeypatch):
     assert store.claim_next() is None
 
 
+@_posix_only_perms
 def test_queue_db_file_is_owner_only(tmp_path, monkeypatch):
     """The queue DB holds verbatim payloads — it must be 0600, not the sqlite
     default 0644. Regression for the privacy-principle violation."""
@@ -370,6 +395,7 @@ def test_queue_db_file_is_owner_only(tmp_path, monkeypatch):
     assert mode == 0o600, f"queue.sqlite3 is {oct(mode)}, expected 0600"
 
 
+@_posix_only_perms
 def test_token_file_is_owner_only(tmp_path, monkeypatch):
     import os as _os
 
@@ -476,6 +502,40 @@ def test_daemon_client_raises_on_endpoint_missing_port(tmp_path, monkeypatch):
 
     with pytest.raises(daemon.DaemonError):
         daemon.DaemonClient(str(palace))
+
+
+def test_pid_alive_probe_is_signal_free_and_correct():
+    """``_pid_alive`` must be a pure liveness probe.
+
+    On Windows ``os.kill(pid, 0)`` is NOT harmless — signal 0 is
+    ``CTRL_C_EVENT``, so it emits a console Ctrl-C to the target's process
+    group. The daemon client polls a same-process endpoint, so that Ctrl-C was
+    delivered back to the interpreter and surfaced as a spurious
+    ``KeyboardInterrupt`` that hung the whole test session on CI runners (which,
+    unlike a detached dev shell, have an attached console). Assert the probe is
+    both correct and emits no SIGINT even when hammered like the poll loop.
+    """
+    import signal
+
+    assert daemon._pid_alive(os.getpid()) is True
+    assert daemon._pid_alive(0) is False
+    assert daemon._pid_alive(-1) is False
+    # A pid that is almost certainly not running.
+    assert daemon._pid_alive(2_000_000_000) is False
+
+    # pytest runs tests on the main thread, so installing a SIGINT handler is
+    # allowed. If the probe regresses to os.kill(pid, 0) on Windows, the repeated
+    # calls below deliver CTRL_C_EVENT and this handler fires.
+    fired = []
+    previous = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGINT, lambda *_: fired.append(1))
+    try:
+        for _ in range(25):
+            daemon._pid_alive(os.getpid())
+        time.sleep(0.25)
+    finally:
+        signal.signal(signal.SIGINT, previous)
+    assert fired == [], "_pid_alive delivered a console control event (CTRL_C_EVENT)"
 
 
 def test_start_daemon_kills_orphan_on_readiness_timeout(tmp_path, monkeypatch):
