@@ -216,6 +216,7 @@ def sqlite_read_uri(db_path: str) -> str:
     """
     from urllib.request import pathname2url
 
+    db_path = os.fspath(db_path)
     return f"file:{pathname2url(db_path)}?mode=ro"
 
 
