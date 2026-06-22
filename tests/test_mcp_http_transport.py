@@ -1,302 +1,210 @@
 # tests/test_mcp_http_transport.py
 """
-Tests for the opt-in HTTP transport added in fix for #1801.
+Tests for the opt-in HTTP transport added for #1801.
+
+These exercise the *production* server built by
+``mempalace.mcp_server._build_http_server`` over a real loopback socket on an
+ephemeral port — the earlier version of this file reimplemented the endpoint in
+Starlette and guarded on ``pytest.importorskip("starlette")``/``uvicorn``,
+neither of which is a project dependency, so it was silently skipped in CI and
+the real ``_serve_http`` handler had zero coverage.
 
 Design constraints
 ------------------
-* No real sockets — avoids port conflicts and firewall issues on all CI
-  runners (Linux, macOS, Windows).
-* No asyncio.get_event_loop() — deprecated in 3.10, raises in 3.12+.
-* No asyncio primitives created at module/class scope — they must be
-  constructed inside a running event loop (Python 3.10+ requirement).
-* threading.Lock (not asyncio.Lock) for the dispatch lock in tests —
-  safe on all platforms including Windows ProactorEventLoop.
-* Uses Starlette's synchronous TestClient so we stay in normal pytest
-  (no pytest-asyncio dependency needed).
+* Real sockets, but bound to ``127.0.0.1:0`` (OS-assigned port) so there is no
+  port conflict on any CI runner.
+* Pure stdlib (``http.client``, ``threading``) — no third-party deps.
+* Server runs in a daemon thread and is shut down in fixture teardown.
 """
 
+import http.client
+import json
 import threading
-import types
-import sys
+
 import pytest
 
-# ── Optional dependency guard ──────────────────────────────────────────
-starlette = pytest.importorskip("starlette", reason="starlette not installed")
-pytest.importorskip("uvicorn", reason="uvicorn not installed")
-
-from starlette.applications import Starlette  # noqa: E402
-from starlette.requests import Request  # noqa: E402
-from starlette.responses import JSONResponse, Response  # noqa: E402
-from starlette.routing import Route  # noqa: E402
-from starlette.testclient import TestClient  # noqa: E402
+from mempalace import mcp_server as mcp
 
 
-# ── Stub out heavy dependencies so import succeeds in CI without a palace ─
-def _install_stubs():
-    stub_chroma = types.ModuleType("chromadb")
-    stub_chroma.PersistentClient = lambda **kw: None
-    sys.modules.setdefault("chromadb", stub_chroma)
-
-    for name in [
-        "mempalace.knowledge_graph",
-        "mempalace.searcher",
-        "mempalace.palace_graph",
-        "mempalace.config",
-        "mempalace.backends",
-        "mempalace.backends.base",
-    ]:
-        if name not in sys.modules:
-            m = types.ModuleType(name)
-            m.KnowledgeGraph = lambda: types.SimpleNamespace(
-                query_entity=lambda *a, **kw: [],
-                add_triple=lambda *a, **kw: "id",
-                invalidate=lambda *a, **kw: None,
-                timeline=lambda *a, **kw: [],
-                stats=lambda: {},
-            )
-            m.search_memories = lambda *a, **kw: []
-            m.traverse = lambda *a, **kw: {}
-            m.find_tunnels = lambda *a, **kw: {}
-            m.graph_stats = lambda *a, **kw: {}
-            m.MempalaceConfig = lambda: types.SimpleNamespace(
-                palace_path="~/.mempalace/palace",
-                collection_name="mempalace",
-            )
-            sys.modules[name] = m
-
-
-_install_stubs()
-import mempalace.mcp_server as _srv  # noqa: E402  (after stubs)
-
-
-# ── Build a minimal Starlette app that mirrors _serve_http() ──────────────
-# Key differences from production code:
-#   - threading.Lock instead of asyncio.Lock (safe on Windows too)
-#   - handle_request() called directly (no executor) — it is synchronous
-#   - Lock created here at *function* scope, not module scope
-#
-# This tests the same dispatch logic that _serve_http() exercises without
-# touching sockets or asyncio event loop internals.
-
-_dispatch_lock = threading.Lock()
-
-
-async def _mcp_endpoint(request: Request) -> Response:
+def _post(port, path, body, headers=None, host_header=None):
+    """Raw POST with full control over Host / Origin / Authorization headers."""
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
     try:
-        payload = await request.json()
-    except Exception as exc:
-        return JSONResponse(
-            {
-                "jsonrpc": "2.0",
-                "id": None,
-                "error": {"code": -32700, "message": f"Parse error: {exc}"},
-            },
-            status_code=400,
-        )
-    with _dispatch_lock:
-        result = _srv.handle_request(payload)
-    if result is None:
-        return Response(status_code=202)
-    return JSONResponse(result)
+        raw = body if isinstance(body, (bytes, bytearray)) else json.dumps(body).encode("utf-8")
+        headers = headers or {}
+        conn.putrequest("POST", path, skip_host=(host_header is not None))
+        if host_header is not None:
+            conn.putheader("Host", host_header)
+        conn.putheader("Content-Type", "application/json")
+        # Let a caller override Content-Length (used to fake an oversized body)
+        # instead of emitting a second, conflicting header.
+        if not any(k.lower() == "content-length" for k in headers):
+            conn.putheader("Content-Length", str(len(raw)))
+        for k, v in headers.items():
+            conn.putheader(k, v)
+        conn.endheaders()
+        conn.send(raw)
+        resp = conn.getresponse()
+        return resp.status, resp.read()
+    finally:
+        conn.close()
 
 
-async def _health(request: Request) -> Response:
-    return JSONResponse({"status": "ok", "tools": len(_srv.TOOLS)})
+def _get(port, path, headers=None):
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    try:
+        conn.request("GET", path, headers=headers or {})
+        resp = conn.getresponse()
+        return resp.status, resp.read()
+    finally:
+        conn.close()
 
 
-_app = Starlette(
-    routes=[
-        Route("/mcp", _mcp_endpoint, methods=["POST"]),
-        Route("/health", _health, methods=["GET"]),
-    ]
-)
+@pytest.fixture
+def http_server():
+    """A running production MCP HTTP server on an ephemeral loopback port."""
+    httpd = mcp._build_http_server("127.0.0.1", 0)
+    port = httpd.server_address[1]
+    thread = threading.Thread(
+        target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+    )
+    thread.start()
+    try:
+        yield port, httpd
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
 
 
-@pytest.fixture(scope="module")
-def client():
-    """Synchronous Starlette TestClient — no event loop juggling needed."""
-    with TestClient(_app, raise_server_exceptions=True) as c:
-        yield c
+def test_post_dispatches_to_handle_request(http_server):
+    """A real POST to /mcp reaches handle_request and returns its JSON-RPC reply."""
+    port, _ = http_server
+    status, body = _post(port, "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["id"] == 1
+    names = {t["name"] for t in payload["result"]["tools"]}
+    assert "mempalace_search" in names
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────
+def test_initialize_reports_server_info(http_server):
+    port, _ = http_server
+    status, body = _post(port, "/mcp", {"jsonrpc": "2.0", "id": 7, "method": "initialize"})
+    assert status == 200
+    assert json.loads(body)["result"]["serverInfo"]["name"] == "mempalace"
 
 
-def _tools_list(req_id=1):
-    return {"jsonrpc": "2.0", "id": req_id, "method": "tools/list", "params": {}}
+def test_healthz_ok(http_server):
+    port, _ = http_server
+    status, body = _get(port, "/healthz")
+    assert status == 200
+    assert body == b"ok\n"
 
 
-def _initialize(req_id=1):
-    return {
-        "jsonrpc": "2.0",
-        "id": req_id,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "test", "version": "0"},
-        },
-    }
+def test_unknown_path_404(http_server):
+    port, _ = http_server
+    assert _post(port, "/nope", {"jsonrpc": "2.0", "id": 1, "method": "ping"})[0] == 404
+    assert _get(port, "/nope")[0] == 404
 
 
-# ── Tests ─────────────────────────────────────────────────────────────────
+def test_invalid_json_returns_parse_error(http_server):
+    port, _ = http_server
+    status, body = _post(port, "/mcp", b"{not valid json")
+    assert status == 400
+    assert json.loads(body)["error"]["code"] == -32700
 
 
-class TestHealth:
-    def test_returns_200(self, client):
-        r = client.get("/health")
-        assert r.status_code == 200
-
-    def test_reports_tool_count(self, client):
-        r = client.get("/health")
-        assert r.json()["status"] == "ok"
-        assert r.json()["tools"] == len(_srv.TOOLS)
-        assert r.json()["tools"] > 0
-
-
-class TestToolsList:
-    def test_returns_all_tools(self, client):
-        r = client.post("/mcp", json=_tools_list())
-        assert r.status_code == 200
-        data = r.json()
-        assert data["id"] == 1
-        assert "tools" in data["result"]
-        assert len(data["result"]["tools"]) == len(_srv.TOOLS)
-
-    def test_content_type_is_json(self, client):
-        r = client.post("/mcp", json=_tools_list())
-        assert "application/json" in r.headers["content-type"]
-
-    def test_id_preserved(self, client):
-        for rid in [1, 99, "abc-id"]:
-            r = client.post("/mcp", json=_tools_list(req_id=rid))
-            assert r.json()["id"] == rid
-
-    def test_idempotent_repeated_calls(self, client):
-        sets = [
-            frozenset(
-                t["name"]
-                for t in client.post("/mcp", json=_tools_list(i)).json()["result"]["tools"]
-            )
-            for i in range(20)
-        ]
-        assert len(set(sets)) == 1, "tools/list returned different sets across calls"
-
-    def test_all_tools_have_name_and_schema(self, client):
-        tools = client.post("/mcp", json=_tools_list()).json()["result"]["tools"]
-        for tool in tools:
-            assert "name" in tool
-            assert "inputSchema" in tool
+def test_oversized_request_rejected_413(http_server):
+    """A declared Content-Length over the cap is rejected before the body is read."""
+    port, _ = http_server
+    # Lie about the length: the handler checks the header and returns 413 before
+    # reading the (tiny) body, so we never have to ship 16 MiB.
+    status, body = _post(
+        port,
+        "/mcp",
+        b"{}",
+        headers={"Content-Length": str(mcp._HTTP_MAX_REQUEST_BYTES + 1)},
+    )
+    assert status == 413
+    assert json.loads(body)["error"]["code"] == -32600
 
 
-class TestInitialize:
-    def test_protocol_version(self, client):
-        r = client.post("/mcp", json=_initialize())
-        assert r.status_code == 200
-        assert r.json()["result"]["protocolVersion"] == "2024-11-05"
-
-    def test_capabilities_advertised(self, client):
-        caps = client.post("/mcp", json=_initialize()).json()["result"]["capabilities"]
-        assert "tools" in caps
+def test_notification_returns_202_no_body(http_server):
+    port, _ = http_server
+    status, body = _post(port, "/mcp", {"jsonrpc": "2.0", "method": "notifications/initialized"})
+    assert status == 202
+    assert body == b""
 
 
-class TestNotifications:
-    def test_initialized_returns_202(self, client):
-        r = client.post(
-            "/mcp",
-            json={
-                "jsonrpc": "2.0",
-                "method": "notifications/initialized",
-                "params": {},
-            },
-        )
-        assert r.status_code == 202
-        assert r.content == b""  # no body for notifications
-
-    def test_other_notification_returns_202(self, client):
-        r = client.post(
-            "/mcp",
-            json={
-                "jsonrpc": "2.0",
-                "method": "notifications/progress",
-                "params": {"progressToken": 1, "progress": 50},
-            },
-        )
-        assert r.status_code == 202
+def test_rejects_foreign_host_header(http_server):
+    """DNS-rebinding guard: a request carrying an attacker domain in Host is 403."""
+    port, _ = http_server
+    status, _ = _post(
+        port,
+        "/mcp",
+        {"jsonrpc": "2.0", "id": 1, "method": "ping"},
+        host_header="evil.example.com",
+    )
+    assert status == 403
 
 
-class TestErrorHandling:
-    def test_unknown_method_returns_32601(self, client):
-        r = client.post(
-            "/mcp",
-            json={
-                "jsonrpc": "2.0",
-                "id": 99,
-                "method": "bogus/method",
-                "params": {},
-            },
-        )
-        data = r.json()
-        assert data["error"]["code"] == -32601
-        assert data["error"]["message"] != ""
-
-    def test_unknown_tool_returns_32601(self, client):
-        r = client.post(
-            "/mcp",
-            json={
-                "jsonrpc": "2.0",
-                "id": 5,
-                "method": "tools/call",
-                "params": {"name": "nonexistent_tool", "arguments": {}},
-            },
-        )
-        assert r.json()["error"]["code"] == -32601
-
-    def test_malformed_json_returns_400(self, client):
-        r = client.post(
-            "/mcp",
-            content=b"not json at all{{{",
-            headers={"content-type": "application/json"},
-        )
-        assert r.status_code == 400
-        assert r.json()["error"]["code"] == -32700
-
-    def test_ping_returns_empty_result(self, client):
-        r = client.post(
-            "/mcp",
-            json={
-                "jsonrpc": "2.0",
-                "id": 3,
-                "method": "ping",
-                "params": {},
-            },
-        )
-        assert r.json()["result"] == {}
+def test_rejects_cross_origin(http_server):
+    """A browser Origin from a non-loopback page is 403 (rebinding/SSRF guard)."""
+    port, _ = http_server
+    status, _ = _post(
+        port,
+        "/mcp",
+        {"jsonrpc": "2.0", "id": 1, "method": "ping"},
+        headers={"Origin": "https://evil.example"},
+    )
+    assert status == 403
 
 
-class TestConcurrency:
-    def test_concurrent_tools_list(self, client):
-        """
-        Fire 10 parallel requests via threads (mirrors real concurrent HTTP
-        clients).  All must return the same tool set with no data races.
-        Uses threading.Lock in the dispatch layer so this is safe on every
-        platform.
-        """
-        results = []
-        errors = []
+def test_allows_loopback_origin(http_server):
+    port, _ = http_server
+    status, _ = _post(
+        port,
+        "/mcp",
+        {"jsonrpc": "2.0", "id": 1, "method": "ping"},
+        headers={"Origin": "http://localhost:5173"},
+    )
+    assert status == 200
 
-        def call():
-            try:
-                r = client.post("/mcp", json=_tools_list())
-                results.append(frozenset(t["name"] for t in r.json()["result"]["tools"]))
-            except Exception as exc:
-                errors.append(exc)
 
-        threads = [threading.Thread(target=call) for _ in range(10)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+def test_bearer_token_enforced_when_configured(monkeypatch):
+    """With MEMPALACE_MCP_HTTP_TOKEN set, /mcp requires a matching bearer token."""
+    monkeypatch.setenv("MEMPALACE_MCP_HTTP_TOKEN", "s3cret")
+    httpd = mcp._build_http_server("127.0.0.1", 0)
+    port = httpd.server_address[1]
+    thread = threading.Thread(
+        target=httpd.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+    )
+    thread.start()
+    try:
+        ping = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+        # No token → 401.
+        assert _post(port, "/mcp", ping)[0] == 401
+        # Wrong token → 401.
+        assert _post(port, "/mcp", ping, headers={"Authorization": "Bearer nope"})[0] == 401
+        # Correct token → 200.
+        assert _post(port, "/mcp", ping, headers={"Authorization": "Bearer s3cret"})[0] == 200
+        # /healthz never requires the token (orchestrator liveness probes).
+        assert _get(port, "/healthz")[0] == 200
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
 
-        assert not errors, f"Threads raised: {errors}"
-        assert len(set(results)) == 1, "Concurrent calls returned different tool sets"
+
+def test_loopback_and_origin_helpers():
+    assert mcp._http_is_loopback("127.0.0.1")
+    assert mcp._http_is_loopback("localhost")
+    assert not mcp._http_is_loopback("0.0.0.0")
+    assert not mcp._http_is_loopback("192.168.1.10")
+    assert mcp._http_origin_allowed("http://127.0.0.1:8765")
+    assert mcp._http_origin_allowed("http://localhost")
+    assert not mcp._http_origin_allowed("https://evil.example")
+    assert not mcp._http_origin_allowed("garbage")
+    allowed = mcp._http_allowed_host_values("127.0.0.1", 8765)
+    assert "127.0.0.1:8765" in allowed and "localhost" in allowed

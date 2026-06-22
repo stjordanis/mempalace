@@ -48,6 +48,7 @@ import json  # noqa: E402
 import logging  # noqa: E402
 import re  # noqa: E402
 import hashlib  # noqa: E402
+import hmac  # noqa: E402
 import sqlite3  # noqa: E402
 import threading  # noqa: E402
 import time  # noqa: E402
@@ -4562,29 +4563,71 @@ def _json_rpc_parse_error(req_id=None):
     }
 
 
-# Module-level lock and limit used by the HTTP transport.
-# Must be at module scope so _serve_http() and any future HTTP helpers
-# can reference them without a closure or import.
-
-
 # Module-level constants for the HTTP transport.
-# Defined here (not inside main()) so _serve_http() and _run_http_loop()
+# Defined here (not inside main()) so _serve_http() / _build_http_server()
 # can reference them as free names without a NameError.
 _HTTP_REQUEST_LOCK = threading.Lock()
 _HTTP_MAX_REQUEST_BYTES = 16 * 1024 * 1024
+# Host literals that always denote this machine. Used both to decide whether a
+# bind is loopback (skip the network-exposure warning) and to pin the Host
+# header against DNS rebinding when serving on loopback.
+_HTTP_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1", "[::1]")
 
 
-def _serve_http(host: str, port: int) -> None:
-    """Serve JSON-RPC over HTTP in-process.
+def _http_is_loopback(host: str) -> bool:
+    """Whether ``host`` binds only to this machine."""
+    return (host or "").strip().lower() in _HTTP_LOOPBACK_HOSTS
 
-    This transport intentionally reuses the same ``handle_request`` dispatcher
-    as stdio. The only change is the framing layer: HTTP mode avoids a
-    long-lived stdout pipe for operators who run MemPalace behind an HTTP MCP
-    client/proxy for days at a time.
+
+def _http_allowed_host_values(bind_host: str, port: int) -> set:
+    """Host-header values accepted when Host pinning is enforced.
+
+    DNS-rebinding defense: a browser tricked into POSTing to ``127.0.0.1`` by a
+    malicious page still carries the *attacker's* domain in the ``Host`` header,
+    so we pin ``Host`` to the loopback literals (and the bound host) with and
+    without the port. Computed from the *actual* bound port so an ephemeral
+    ``port=0`` bind (tests) still matches.
     """
+    names = set(_HTTP_LOOPBACK_HOSTS)
+    if bind_host:
+        names.add(bind_host.strip().lower())
+    values = set()
+    for name in names:
+        values.add(name)
+        values.add(f"{name}:{port}")
+    return values
 
+
+def _http_origin_allowed(origin: str) -> bool:
+    """Whether a browser ``Origin`` header may call the transport.
+
+    Non-browser MCP clients omit ``Origin`` entirely (allowed). When an
+    ``Origin`` *is* present it must be a loopback origin — this is what stops a
+    page at ``https://evil.example`` from reaching a DNS-rebound localhost
+    server and reading the palace.
+    """
+    from urllib.parse import urlparse
+
+    try:
+        host = (urlparse(origin).hostname or "").strip().lower()
+    except Exception:
+        return False
+    return host in ("127.0.0.1", "localhost", "::1")
+
+
+def _build_http_server(host: str, port: int):
+    """Construct (but do not start) the MCP HTTP server.
+
+    Split out from :func:`_serve_http` so tests can bind an ephemeral port,
+    exercise the *real* handler, and shut it down — the previous test reached
+    for Starlette/uvicorn (neither a dependency) and so was silently skipped in
+    CI. Returns a bound ``ThreadingHTTPServer`` whose request policy (Host
+    allowlist, Origin check, optional bearer token) is attached as attributes.
+    """
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from urllib.parse import urlparse
+
+    auth_token = os.environ.get("MEMPALACE_MCP_HTTP_TOKEN", "").strip()
 
     class _MCPHTTPServer(ThreadingHTTPServer):
         daemon_threads = True
@@ -4610,7 +4653,39 @@ def _serve_http(host: str, port: int) -> None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self._send_bytes(status, body, "application/json; charset=utf-8")
 
+        def _request_rejected(self, require_auth: bool) -> bool:
+            """Enforce the transport's access policy before any dispatch.
+
+            The palace is the most sensitive data MemPalace holds and ``/mcp``
+            is unauthenticated by default, so this guards the two ways a local
+            HTTP server leaks to the network: DNS rebinding (Host/Origin) and,
+            when the operator opts in, a missing/incorrect bearer token.
+            """
+            srv = self.server
+            if srv.enforce_host_pin:
+                host_hdr = (self.headers.get("Host") or "").strip().lower()
+                if host_hdr not in srv.allowed_hosts:
+                    logger.warning("HTTP request rejected: Host %r not allowed", host_hdr)
+                    self.send_error(403, "Forbidden")
+                    return True
+            origin = self.headers.get("Origin")
+            if origin and not _http_origin_allowed(origin):
+                logger.warning("HTTP request rejected: cross-origin %r", origin)
+                self.send_error(403, "Forbidden")
+                return True
+            if require_auth and srv.auth_token:
+                provided = self.headers.get("Authorization", "")
+                if not hmac.compare_digest(provided, f"Bearer {srv.auth_token}"):
+                    logger.warning("HTTP request rejected: missing/invalid bearer token")
+                    self.send_error(401, "Unauthorized")
+                    return True
+            return False
+
         def do_GET(self):
+            # Liveness probe is policy-gated for Host/Origin but never requires
+            # the token, so an orchestrator's health check works without creds.
+            if self._request_rejected(require_auth=False):
+                return
             path = urlparse(self.path).path
             if path == "/healthz":
                 self._send_bytes(200, b"ok\n", "text/plain; charset=utf-8")
@@ -4619,6 +4694,8 @@ def _serve_http(host: str, port: int) -> None:
             self.send_error(404, "Not Found")
 
         def do_POST(self):
+            if self._request_rejected(require_auth=True):
+                return
             path = urlparse(self.path).path
             if path != "/mcp":
                 self.send_error(404, "Not Found")
@@ -4665,16 +4742,46 @@ def _serve_http(host: str, port: int) -> None:
 
             self._send_json(200, response)
 
+    httpd = _MCPHTTPServer((host, port), _Handler)
+    bound_port = httpd.server_address[1]
+    # Pin Host only on a loopback bind (the security-critical default). A
+    # deliberately network-exposed bind is the operator's call and may sit
+    # behind a proxy that rewrites Host, so we relax the pin there and lean on
+    # the Origin check + optional token instead.
+    httpd.enforce_host_pin = _http_is_loopback(host)
+    httpd.allowed_hosts = _http_allowed_host_values(host, bound_port)
+    httpd.auth_token = auth_token
+    return httpd
+
+
+def _serve_http(host: str, port: int) -> None:
+    """Serve JSON-RPC over HTTP in-process.
+
+    This transport intentionally reuses the same ``handle_request`` dispatcher
+    as stdio. The only change is the framing layer: HTTP mode avoids a
+    long-lived stdout pipe for operators who run MemPalace behind an HTTP MCP
+    client/proxy for days at a time.
+    """
     try:
-        with _MCPHTTPServer((host, port), _Handler) as httpd:
-            logger.info("MemPalace MCP HTTP server listening on http://%s:%s/mcp", host, port)
-            try:
-                httpd.serve_forever(poll_interval=0.5)
-            except KeyboardInterrupt:
-                logger.info("MemPalace MCP HTTP server shutting down")
+        httpd = _build_http_server(host, port)
     except OSError as exc:
         logger.error("Failed to start MCP HTTP server on %s:%s: %s", host, port, exc)
         sys.exit(1)
+
+    bound_port = httpd.server_address[1]
+    if not _http_is_loopback(host):
+        logger.warning(
+            "MemPalace MCP HTTP server bound to non-loopback host %s — the palace "
+            "is now reachable from the network and /mcp is unauthenticated unless "
+            "you set MEMPALACE_MCP_HTTP_TOKEN. Bind 127.0.0.1 to keep it local.",
+            host,
+        )
+    with httpd:
+        logger.info("MemPalace MCP HTTP server listening on http://%s:%s/mcp", host, bound_port)
+        try:
+            httpd.serve_forever(poll_interval=0.5)
+        except KeyboardInterrupt:
+            logger.info("MemPalace MCP HTTP server shutting down")
 
 
 def _run_stdio_loop() -> None:
