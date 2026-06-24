@@ -313,7 +313,16 @@ def cmd_init(args):
                 endpoint=getattr(args, "llm_endpoint", None),
                 api_key=getattr(args, "llm_api_key", None),
             )
-            ok, msg = candidate.check_available()
+            if (
+                provider_name == "openai-compat"
+                and getattr(candidate, "api_key_source", None) == "env"
+                and candidate.is_external_service
+            ):
+                ok = False
+                msg = "external openai-compat init requires explicit --llm-api-key"
+                print(f"  LLM skipped: {msg}")
+            else:
+                ok, msg = candidate.check_available()
             if ok:
                 llm_provider = candidate
                 print(f"  LLM enabled: {provider_name}/{provider_model}")

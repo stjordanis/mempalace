@@ -4572,6 +4572,7 @@ _HTTP_MAX_REQUEST_BYTES = 16 * 1024 * 1024
 # bind is loopback (skip the network-exposure warning) and to pin the Host
 # header against DNS rebinding when serving on loopback.
 _HTTP_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1", "[::1]")
+_HTTP_ALLOW_INSECURE_NO_TOKEN_ENV = "MEMPALACE_MCP_HTTP_ALLOW_INSECURE_NO_TOKEN"
 
 
 def _http_is_loopback(host: str) -> bool:
@@ -4628,6 +4629,16 @@ def _build_http_server(host: str, port: int):
     from urllib.parse import urlparse
 
     auth_token = os.environ.get("MEMPALACE_MCP_HTTP_TOKEN", "").strip()
+    if (
+        not _http_is_loopback(host)
+        and not auth_token
+        and not _truthy_env(_HTTP_ALLOW_INSECURE_NO_TOKEN_ENV)
+    ):
+        raise ValueError(
+            "MEMPALACE_MCP_HTTP_TOKEN is required when binding MCP HTTP to a "
+            f"non-loopback host. Set {_HTTP_ALLOW_INSECURE_NO_TOKEN_ENV}=1 only "
+            "when a trusted fronting layer provides access control."
+        )
 
     class _MCPHTTPServer(ThreadingHTTPServer):
         daemon_threads = True
@@ -4764,18 +4775,25 @@ def _serve_http(host: str, port: int) -> None:
     """
     try:
         httpd = _build_http_server(host, port)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         logger.error("Failed to start MCP HTTP server on %s:%s: %s", host, port, exc)
         sys.exit(1)
 
     bound_port = httpd.server_address[1]
     if not _http_is_loopback(host):
-        logger.warning(
-            "MemPalace MCP HTTP server bound to non-loopback host %s — the palace "
-            "is now reachable from the network and /mcp is unauthenticated unless "
-            "you set MEMPALACE_MCP_HTTP_TOKEN. Bind 127.0.0.1 to keep it local.",
-            host,
-        )
+        if httpd.auth_token:
+            logger.warning(
+                "MemPalace MCP HTTP server bound to non-loopback host %s; /mcp "
+                "requires the configured bearer token.",
+                host,
+            )
+        else:
+            logger.warning(
+                "MemPalace MCP HTTP server bound to non-loopback host %s without "
+                "a bearer token because %s is set.",
+                host,
+                _HTTP_ALLOW_INSECURE_NO_TOKEN_ENV,
+            )
     with httpd:
         logger.info("MemPalace MCP HTTP server listening on http://%s:%s/mcp", host, bound_port)
         try:

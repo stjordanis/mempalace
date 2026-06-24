@@ -33,6 +33,7 @@ import argparse
 import os
 import shutil
 import sqlite3
+import stat
 import time
 from collections import defaultdict
 from contextlib import closing
@@ -55,6 +56,77 @@ REPAIR_TEMP_COLLECTION = f"{COLLECTION_NAME}__repair_tmp"
 # cross-palace AAAK lookups. Drawer collection name comes from config
 # (see ``_recoverable_collections``).
 CLOSETS_COLLECTION_NAME = "mempalace_closets"
+
+
+def _no_follow_flag() -> int:
+    return getattr(os, "O_NOFOLLOW", 0)
+
+
+def _open_regular_file_no_follow(path: str) -> int:
+    if os.path.islink(path):
+        raise RuntimeError(f"Refusing symlinked file: {path}")
+    fd = os.open(path, os.O_RDONLY | _no_follow_flag())
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise RuntimeError(f"Refusing non-regular file: {path}")
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _write_text_replace_no_follow(path: str, text: str) -> None:
+    directory = os.path.dirname(path) or "."
+    basename = os.path.basename(path)
+    tmp_path = os.path.join(
+        directory,
+        f".{basename}.{os.getpid()}.{int(time.time() * 1_000_000)}.tmp",
+    )
+    fd = os.open(
+        tmp_path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | _no_follow_flag(),
+        0o600,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _copy_file_no_follow(src: str, dst: str, *, replace: bool = False) -> None:
+    src_fd = _open_regular_file_no_follow(src)
+    flags = os.O_WRONLY | os.O_CREAT | _no_follow_flag()
+    flags |= os.O_TRUNC if replace else os.O_EXCL
+    dst_fd = os.open(dst, flags, 0o600)
+    try:
+        with os.fdopen(src_fd, "rb") as src_f, os.fdopen(dst_fd, "wb") as dst_f:
+            shutil.copyfileobj(src_f, dst_f)
+        try:
+            shutil.copystat(src, dst, follow_symlinks=False)
+        except OSError:
+            pass
+    except Exception:
+        try:
+            os.close(src_fd)
+        except OSError:
+            pass
+        try:
+            os.close(dst_fd)
+        except OSError:
+            pass
+        raise
+
+
+def _unique_backup_path(path: str, label: str) -> str:
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{path}.{label}.{stamp}.{os.getpid()}"
 
 
 def _drawers_collection_name() -> str:
@@ -316,9 +388,10 @@ def scan_palace(palace_path=None, only_wing=None, collection_name: Optional[str]
     print(f"  BAD:  {len(bad_set):,}  ({len(bad_set) / max(len(all_ids), 1) * 100:.1f}%)")
 
     bad_file = os.path.join(palace_path, "corrupt_ids.txt")
-    with open(bad_file, "w") as f:
-        for bid in sorted(bad_set):
-            f.write(bid + "\n")
+    _write_text_replace_no_follow(
+        bad_file,
+        "".join(f"{bid}\n" for bid in sorted(bad_set)),
+    )
     print(f"\n  Bad IDs written to: {bad_file}")
     return good_set, bad_set
 
@@ -858,10 +931,10 @@ def rebuild_index(
 
     # Back up ONLY the SQLite database, not the bloated HNSW files
     sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
-    backup_path = sqlite_path + ".backup"
+    backup_path = _unique_backup_path(sqlite_path, "backup")
     if os.path.exists(sqlite_path):
         progress(f"  Backing up chroma.sqlite3 ({os.path.getsize(sqlite_path) / 1e6:.0f} MB)...")
-        shutil.copy2(sqlite_path, backup_path)
+        _copy_file_no_follow(sqlite_path, backup_path)
         progress(f"  Backup: {backup_path}")
 
     # Rebuild with correct HNSW settings
@@ -1116,7 +1189,10 @@ def _preserve_knowledge_graph_sqlite(source_palace: str, dest_palace: str) -> li
             continue
 
         os.makedirs(dest_palace, exist_ok=True)
-        shutil.copy2(src, dst)
+        try:
+            _copy_file_no_follow(src, dst, replace=True)
+        except RuntimeError:
+            continue
         copied.append(filename)
 
     if copied:

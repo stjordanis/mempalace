@@ -851,8 +851,13 @@ def _save_diary_direct(
 
 def _ingest_transcript(transcript_path: str):
     """Mine a Claude Code session transcript into the palace as a conversation."""
-    path = Path(transcript_path).expanduser()
-    if not path.is_file() or path.stat().st_size < 100:
+    path = _validate_transcript_path(transcript_path)
+    if path is None:
+        return
+    try:
+        if not path.is_file() or path.stat().st_size < 100:
+            return
+    except OSError:
         return
 
     try:
