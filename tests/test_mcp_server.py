@@ -1096,6 +1096,130 @@ class TestReadTools:
 # ── Regression: None-metadata safety (issue #1426) ──────────────────────
 
 
+class TestMetadataFacets:
+    def test_tool_status_uses_metadata_facets(self, monkeypatch):
+        from unittest.mock import MagicMock
+        import mempalace.mcp_server as mcp
+
+        monkeypatch.setattr(mcp, "_sqlite_taxonomy", lambda: None)
+        monkeypatch.setattr(mcp, "_supports_metadata_facets", lambda _: True)
+
+        col = MagicMock()
+        col.count.return_value = 5
+        col.facet_counts.side_effect = [
+            {"wing_a": 2, "wing_b": 3},
+            {"room_x": 4, "room_y": 1},
+        ]
+        monkeypatch.setattr(mcp, "_get_collection", lambda create=False: col)
+        result = mcp.tool_status()
+
+        assert result["wings"] == {
+            "wing_a": 2,
+            "wing_b": 3,
+        }
+
+        assert result["rooms"] == {
+            "room_x": 4,
+            "room_y": 1,
+        }
+        assert col.facet_counts.call_count == 2
+
+    def test_tool_list_wings_uses_metadata_facets(self, monkeypatch):
+        from unittest.mock import MagicMock
+        import mempalace.mcp_server as mcp
+
+        monkeypatch.setattr(mcp, "_sqlite_taxonomy", lambda: None)
+        monkeypatch.setattr(mcp, "_supports_metadata_facets", lambda _: True)
+
+        col = MagicMock()
+        col.facet_counts.return_value = {
+            "wing_a": 5,
+            "wing_b": 2,
+        }
+        monkeypatch.setattr(mcp, "_get_collection", lambda: col)
+        result = mcp.tool_list_wings()
+
+        assert result == {
+            "wings": {
+                "wing_a": 5,
+                "wing_b": 2,
+            }
+        }
+        col.facet_counts.assert_called_once_with("wing")
+
+    def test_tool_list_rooms_uses_metadata_facets(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        import mempalace.mcp_server as mcp
+
+        monkeypatch.setattr(mcp, "_sqlite_taxonomy", lambda: None)
+        monkeypatch.setattr(mcp, "_supports_metadata_facets", lambda _: True)
+
+        col = MagicMock()
+
+        col.facet_counts.return_value = {
+            "room1": 7,
+            "room2": 3,
+        }
+
+        monkeypatch.setattr(mcp, "_get_collection", lambda: col)
+
+        result = mcp.tool_list_rooms("engineering")
+
+        assert result["rooms"] == {
+            "room1": 7,
+            "room2": 3,
+        }
+
+        from unittest.mock import call
+
+        assert col.facet_counts.call_args_list == [
+            call("room", where={"wing": "engineering"}),
+            call("wing", where={"wing": "engineering"}),
+        ]
+
+    def test_tool_get_taxonomy_uses_metadata_facets(self, monkeypatch):
+        from unittest.mock import MagicMock, call
+        import mempalace.mcp_server as mcp
+
+        monkeypatch.setattr(mcp, "_sqlite_taxonomy", lambda: None)
+        monkeypatch.setattr(mcp, "_supports_metadata_facets", lambda _: True)
+
+        col = MagicMock()
+
+        def facet_counts_mock(field, where=None):
+            if field == "wing":
+                return {"wing_a": 2, "wing_b": 1}
+            if field == "room" and where == {"wing": "wing_a"}:
+                return {"room1": 2}
+            if field == "room" and where == {"wing": "wing_b"}:
+                return {"room2": 1}
+            return {}
+
+        col.facet_counts.side_effect = facet_counts_mock
+
+        monkeypatch.setattr(mcp, "_get_collection", lambda: col)
+
+        result = mcp.tool_get_taxonomy()
+        assert col.facet_counts.call_args_list[0] == call("wing")
+        # Per-wing room facets run concurrently (ThreadPoolExecutor), so order is
+        # non-deterministic. Compare order-independently without a set() — a
+        # ``call`` carrying a dict kwarg is unhashable, so membership (==) is used.
+        room_calls = col.facet_counts.call_args_list[1:]
+        assert len(room_calls) == 2
+        assert call("room", where={"wing": "wing_a"}) in room_calls
+        assert call("room", where={"wing": "wing_b"}) in room_calls
+
+        assert result["taxonomy"] == {
+            "wing_a": {
+                "room1": 2,
+            },
+            "wing_b": {
+                "room2": 1,
+            },
+        }
+
+
 class TestNoneMetadataSafety:
     """Regression coverage for issue #1426.
 

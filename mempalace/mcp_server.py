@@ -1205,6 +1205,15 @@ def _fetch_all_metadata(col, where=None):
     return all_meta
 
 
+def _supports_metadata_facets(col) -> bool:
+    """Return True if the collection's backend implements metadata facets."""
+    backend = getattr(col, "_backend", None)
+    if backend is None:
+        return False
+    capabilities = getattr(backend, "capabilities", None)
+    return isinstance(capabilities, (set, frozenset)) and "supports_metadata_facets" in capabilities
+
+
 _metadata_cache = None
 _metadata_cache_time = 0
 _METADATA_CACHE_TTL = 5.0  # seconds
@@ -1641,13 +1650,47 @@ def tool_status():
         "backend": _selected_backend_name(),
     }
     try:
-        all_meta = _get_cached_metadata(col)
-        for m in all_meta:
-            m = m or {}
-            w = m.get("wing", "unknown")
-            r = m.get("room", "unknown")
-            wings[w] = wings.get(w, 0) + 1
-            rooms[r] = rooms.get(r, 0) + 1
+        if _supports_metadata_facets(col):
+            try:
+                temp_wings = col.facet_counts("wing")
+                wings.update(temp_wings)
+                try:
+                    unknown_wings = count - sum(temp_wings.values())
+                    if unknown_wings > 0:
+                        wings["unknown"] = wings.get("unknown", 0) + unknown_wings
+                except (TypeError, ValueError):
+                    pass
+
+                temp_rooms = col.facet_counts("room")
+                rooms.update(temp_rooms)
+                try:
+                    unknown_rooms = count - sum(temp_rooms.values())
+                    if unknown_rooms > 0:
+                        rooms["unknown"] = rooms.get("unknown", 0) + unknown_rooms
+                except (TypeError, ValueError):
+                    pass
+
+            except Exception as e:
+                logger.warning(
+                    "Failed to fetch metadata facets, falling back to client-side loop: %s", e
+                )
+                rooms.clear()
+                wings.clear()
+                all_meta = _get_cached_metadata(col)
+                for m in all_meta:
+                    m = m or {}
+                    w = m.get("wing", "unknown")
+                    r = m.get("room", "unknown")
+                    wings[w] = wings.get(w, 0) + 1
+                    rooms[r] = rooms.get(r, 0) + 1
+        else:
+            all_meta = _get_cached_metadata(col)
+            for m in all_meta:
+                m = m or {}
+                w = m.get("wing", "unknown")
+                r = m.get("room", "unknown")
+                wings[w] = wings.get(w, 0) + 1
+                rooms[r] = rooms.get(r, 0) + 1
     except Exception as e:
         logger.exception("tool_status metadata fetch failed")
         result["error"] = str(e)
@@ -1702,11 +1745,28 @@ def tool_list_wings():
     wings = {}
     result = {"wings": wings}
     try:
-        all_meta = _get_cached_metadata(col)
-        for m in all_meta:
-            m = m or {}
-            w = m.get("wing", "unknown")
-            wings[w] = wings.get(w, 0) + 1
+        try:
+            if not _supports_metadata_facets(col):
+                raise ValueError("facets not supported")
+            temp_wings = col.facet_counts("wing")
+            wings.update(temp_wings)
+            try:
+                unknown_wings = col.count() - sum(temp_wings.values())
+                if unknown_wings > 0:
+                    wings["unknown"] = wings.get("unknown", 0) + unknown_wings
+            except (TypeError, ValueError):
+                pass
+        except Exception as e:
+            if _supports_metadata_facets(col):
+                logger.warning(
+                    "Failed to fetch metadata facets, falling back to client-side loop: %s", e
+                )
+            wings.clear()
+            all_meta = _get_cached_metadata(col)
+            for m in all_meta:
+                m = m or {}
+                w = m.get("wing", "unknown")
+                wings[w] = wings.get(w, 0) + 1
     except Exception as e:
         logger.exception("tool_list_wings metadata fetch failed")
         result["error"] = str(e)
@@ -1734,13 +1794,34 @@ def tool_list_rooms(wing: str = None):
         return _collection_error_or_no_palace()
     rooms = {}
     result = {"wing": wing or "all", "rooms": rooms}
+    where = {"wing": wing} if wing else None
     try:
-        where = {"wing": wing} if wing else None
-        all_meta = _fetch_all_metadata(col, where=where)
-        for m in all_meta:
-            m = m or {}
-            r = m.get("room", "unknown")
-            rooms[r] = rooms.get(r, 0) + 1
+        try:
+            if not _supports_metadata_facets(col):
+                raise ValueError("facets not supported")
+            temp_rooms = col.facet_counts("room", where=where)
+            rooms.update(temp_rooms)
+            try:
+                if wing:
+                    wing_count = col.facet_counts("wing", where={"wing": wing}).get(wing, 0)
+                    unknown_rooms = wing_count - sum(temp_rooms.values())
+                else:
+                    unknown_rooms = col.count() - sum(temp_rooms.values())
+                if unknown_rooms > 0:
+                    rooms["unknown"] = rooms.get("unknown", 0) + unknown_rooms
+            except (TypeError, ValueError):
+                pass
+        except Exception as e:
+            if _supports_metadata_facets(col):
+                logger.warning(
+                    "Failed to fetch metadata facets, falling back to client-side loop: %s", e
+                )
+            rooms.clear()
+            all_meta = _fetch_all_metadata(col, where=where)
+            for m in all_meta:
+                m = m or {}
+                r = m.get("room", "unknown")
+                rooms[r] = rooms.get(r, 0) + 1
     except Exception as e:
         logger.exception("tool_list_rooms metadata fetch failed")
         result["error"] = str(e)
@@ -1759,14 +1840,42 @@ def tool_get_taxonomy():
     taxonomy = {}
     result = {"taxonomy": taxonomy}
     try:
-        all_meta = _get_cached_metadata(col)
-        for m in all_meta:
-            m = m or {}
-            w = m.get("wing", "unknown")
-            r = m.get("room", "unknown")
-            if w not in taxonomy:
-                taxonomy[w] = {}
-            taxonomy[w][r] = taxonomy[w].get(r, 0) + 1
+        try:
+            if not _supports_metadata_facets(col):
+                raise ValueError("facets not supported")
+            from concurrent.futures import ThreadPoolExecutor
+
+            wing_counts = col.facet_counts("wing")
+            wings = list(wing_counts.keys())
+            temp_taxonomy = {}
+            with ThreadPoolExecutor(max_workers=max(1, min(8, len(wings)))) as executor:
+                futures = {
+                    wing: executor.submit(col.facet_counts, "room", where={"wing": wing})
+                    for wing in wings
+                }
+                for wing, future in futures.items():
+                    room_counts = future.result()
+                    try:
+                        unknown_rooms = wing_counts[wing] - sum(room_counts.values())
+                        if unknown_rooms > 0:
+                            room_counts["unknown"] = room_counts.get("unknown", 0) + unknown_rooms
+                    except (TypeError, ValueError):
+                        pass
+                    temp_taxonomy[wing] = room_counts
+                taxonomy.update(temp_taxonomy)
+        except Exception as e:
+            if _supports_metadata_facets(col):
+                logger.warning(
+                    "Failed to fetch metadata facets, falling back to client-side loop: %s", e
+                )
+            all_meta = _get_cached_metadata(col)
+            for m in all_meta:
+                m = m or {}
+                w = m.get("wing", "unknown")
+                r = m.get("room", "unknown")
+                if w not in taxonomy:
+                    taxonomy[w] = {}
+                taxonomy[w][r] = taxonomy[w].get(r, 0) + 1
     except Exception as e:
         logger.exception("tool_get_taxonomy metadata fetch failed")
         result["error"] = str(e)
