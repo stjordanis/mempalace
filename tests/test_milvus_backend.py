@@ -115,7 +115,7 @@ def test_milvus_lite_upsert_update_delete_get_order_and_multi_collection(tmp_pat
             metadatas=[{"wing": "a"}, {"wing": "b"}],
             embeddings=[[1, 0], [0, 1]],
         )
-        closets.upsert(
+        closets.add(
             ids=["one"],
             documents=["closet document"],
             metadatas=[{"wing": "closet"}],

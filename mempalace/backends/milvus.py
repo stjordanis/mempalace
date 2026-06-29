@@ -54,9 +54,18 @@ FIELD_ID = "id"
 FIELD_DOCUMENT = "document"
 FIELD_METADATA = "metadata"
 FIELD_VECTOR = "vector"
+FIELD_SPARSE = "sparse"
 DOCUMENT_MAX_LENGTH = 65535
 DRAWER_ID_MAX_LENGTH = 512
-RESERVED_FIELDS = {FIELD_ID, FIELD_DOCUMENT, FIELD_METADATA, FIELD_VECTOR, "distance", "score"}
+RESERVED_FIELDS = {
+    FIELD_ID,
+    FIELD_DOCUMENT,
+    FIELD_METADATA,
+    FIELD_VECTOR,
+    FIELD_SPARSE,
+    "distance",
+    "score",
+}
 
 _FIELD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
@@ -339,6 +348,7 @@ class MilvusCollection(BaseCollection):
         self._lock = threading.RLock()
         self._closed = False
         self._known_dimension: Optional[int] = None
+        self._known_native_lexical: Optional[bool] = None
 
     def _ensure_open(self) -> None:
         if self._closed or self._backend._closed:
@@ -396,11 +406,15 @@ class MilvusCollection(BaseCollection):
                     )
                 return
             if not self._remote_exists():
-                self._backend._create_remote_collection(
-                    self._client, self._remote_collection, dimension
+                native_lexical = self._backend._create_remote_collection(
+                    self._client,
+                    self._remote_collection,
+                    dimension,
+                    enable_native_lexical=self._backend._enable_native_lexical(self._config),
                 )
                 self._backend._load_remote_collection(self._client, self._remote_collection)
                 self._known_dimension = dimension
+                self._known_native_lexical = native_lexical
                 self._backend._write_marker(self._palace, self._config)
                 return
             remote_dim = self._remote_dimension()
@@ -410,6 +424,26 @@ class MilvusCollection(BaseCollection):
                     f"embedding dimension {remote_dim}, got {dimension}"
                 )
             self._known_dimension = remote_dim or dimension
+
+    def _has_native_lexical(self) -> bool:
+        if self._known_native_lexical is not None:
+            return self._known_native_lexical
+        if not self._remote_exists():
+            self._known_native_lexical = False
+            return False
+        try:
+            info = self._client.describe_collection(self._remote_collection)
+        except Exception:
+            logger.debug("Milvus describe_collection failed", exc_info=True)
+            self._known_native_lexical = False
+            return False
+        fields = []
+        if isinstance(info, dict):
+            fields = info.get("fields") or (info.get("schema") or {}).get("fields") or []
+        self._known_native_lexical = any(
+            (field.get("name") or field.get("field_name")) == FIELD_SPARSE for field in fields
+        )
+        return self._known_native_lexical
 
     def _output_fields(self, spec: _IncludeSpec) -> list[str]:
         fields = [FIELD_ID]
@@ -515,9 +549,10 @@ class MilvusCollection(BaseCollection):
         )
         if not rows:
             return
-        existing = self.get(ids=list(ids), include=[])
-        if existing.ids:
-            raise ValueError(f"ids already exist in milvus collection: {existing.ids}")
+        if self._remote_exists():
+            existing = self.get(ids=list(ids), include=[])
+            if existing.ids:
+                raise ValueError(f"ids already exist in milvus collection: {existing.ids}")
         self._ensure_remote_collection(dimension)
         self._client.insert(collection_name=self._remote_collection, data=rows)
         self._flush()
@@ -802,6 +837,14 @@ class MilvusCollection(BaseCollection):
 
     def lexical_search(self, *, query: str, n_results: int = 10, where: Optional[dict] = None):
         filter_expr = translate_where(where)
+        if self._has_native_lexical():
+            native = self._native_lexical_search(
+                query=query,
+                n_results=n_results,
+                filter_expr=filter_expr,
+            )
+            if native is not None:
+                return native
         rows = self._collect_by_filter(
             filter_expr=filter_expr,
             output_fields=[FIELD_ID, FIELD_DOCUMENT, FIELD_METADATA],
@@ -819,6 +862,43 @@ class MilvusCollection(BaseCollection):
         ]
         hits.sort(key=lambda hit: hit.score, reverse=True)
         return LexicalResult(hits=hits[:n_results])
+
+    def _native_lexical_search(
+        self,
+        *,
+        query: str,
+        n_results: int,
+        filter_expr: str,
+    ) -> Optional[LexicalResult]:
+        try:
+            kwargs = {
+                "collection_name": self._remote_collection,
+                "data": [query],
+                "anns_field": FIELD_SPARSE,
+                "output_fields": [FIELD_ID, FIELD_DOCUMENT, FIELD_METADATA],
+                "limit": int(n_results),
+                "search_params": {"params": {}},
+            }
+            if filter_expr:
+                kwargs["filter"] = filter_expr
+            raw = self._client.search(**kwargs)
+        except Exception:
+            logger.debug(
+                "Milvus native BM25 search failed; using local BM25 fallback", exc_info=True
+            )
+            return None
+        rows = [self._row_from_search_hit(hit) for hit in (raw[0] if raw else [])]
+        return LexicalResult(
+            hits=[
+                LexicalHit(
+                    id=str(row.get(FIELD_ID, "")),
+                    document=row.get(FIELD_DOCUMENT, ""),
+                    metadata=self._extract_metadata(row),
+                    score=float(row.get("distance", row.get("score", 0.0)) or 0.0),
+                )
+                for row in rows
+            ]
+        )
 
     def close(self) -> None:
         self._closed = True
@@ -1005,6 +1085,10 @@ class MilvusBackend(BaseBackend):
             self._clients[config] = client
             return client
 
+    @staticmethod
+    def _enable_native_lexical(config: _MilvusConfig) -> bool:
+        return bool(config.uri and _is_server_uri(config.uri))
+
     def get_collection(self, *args, **kwargs) -> MilvusCollection:
         palace, collection_name, create, options = self._normalize_args(args, kwargs)
         config = self._effective_config(palace, options)
@@ -1094,7 +1178,44 @@ class MilvusBackend(BaseBackend):
             )
         raise TypeError("get_collection requires palace= or a positional palace_path")
 
-    def _create_remote_collection(self, client, collection_name: str, dimension: int) -> None:
+    def _create_remote_collection(
+        self,
+        client,
+        collection_name: str,
+        dimension: int,
+        *,
+        enable_native_lexical: bool,
+    ) -> bool:
+        if enable_native_lexical:
+            try:
+                self._create_remote_collection_schema(
+                    client,
+                    collection_name,
+                    dimension,
+                    enable_native_lexical=True,
+                )
+                return True
+            except Exception:
+                logger.debug(
+                    "Milvus native BM25 schema creation failed; retrying dense-only schema",
+                    exc_info=True,
+                )
+        self._create_remote_collection_schema(
+            client,
+            collection_name,
+            dimension,
+            enable_native_lexical=False,
+        )
+        return False
+
+    def _create_remote_collection_schema(
+        self,
+        client,
+        collection_name: str,
+        dimension: int,
+        *,
+        enable_native_lexical: bool,
+    ) -> None:
         from pymilvus import DataType
 
         schema = client.create_schema(auto_id=False, enable_dynamic_field=True)
@@ -1108,6 +1229,7 @@ class MilvusBackend(BaseBackend):
             field_name=FIELD_DOCUMENT,
             datatype=DataType.VARCHAR,
             max_length=DOCUMENT_MAX_LENGTH,
+            enable_analyzer=enable_native_lexical,
         )
         schema.add_field(field_name=FIELD_METADATA, datatype=DataType.JSON)
         schema.add_field(
@@ -1115,12 +1237,31 @@ class MilvusBackend(BaseBackend):
             datatype=DataType.FLOAT_VECTOR,
             dim=int(dimension),
         )
+        if enable_native_lexical:
+            from pymilvus import Function, FunctionType
+
+            schema.add_field(field_name=FIELD_SPARSE, datatype=DataType.SPARSE_FLOAT_VECTOR)
+            schema.add_function(
+                Function(
+                    name="document_bm25",
+                    input_field_names=[FIELD_DOCUMENT],
+                    output_field_names=[FIELD_SPARSE],
+                    function_type=FunctionType.BM25,
+                )
+            )
         index_params = client.prepare_index_params()
         index_params.add_index(
             field_name=FIELD_VECTOR,
             index_type="AUTOINDEX",
             metric_type="COSINE",
         )
+        if enable_native_lexical:
+            index_params.add_index(
+                field_name=FIELD_SPARSE,
+                index_type="SPARSE_INVERTED_INDEX",
+                metric_type="BM25",
+                params={"inverted_index_algo": "DAAT_MAXSCORE"},
+            )
         client.create_collection(
             collection_name=collection_name,
             schema=schema,

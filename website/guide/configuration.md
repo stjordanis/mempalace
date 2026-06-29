@@ -15,8 +15,8 @@ Located at `~/.mempalace/config.json`:
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `palace_path` | `~/.mempalace/palace` | Where ChromaDB stores your drawers |
-| `collection_name` | `mempalace_drawers` | ChromaDB collection name |
+| `palace_path` | `~/.mempalace/palace` | Where the default local palace stores your drawers |
+| `collection_name` | `mempalace_drawers` | Default backend collection name |
 | `people_map` | `{}` | Entity name → AAAK code mappings |
 | `max_backups` | `10` | How many timestamped palace backups to keep before the oldest are pruned. Applies to `mempalace migrate` (`<palace>.pre-migrate.*`) and `mempalace repair max-seq-id` (`chroma.sqlite3.max-seq-id-backup-*`), which each write a full copy every run. Set to `0` to keep every backup (e.g. when an external retention policy manages cleanup). |
 
