@@ -422,6 +422,38 @@ class MempalaceConfig:
         return timeout if timeout > 0 else 10.0
 
     @property
+    def milvus_uri(self):
+        """Milvus endpoint for the opt-in ``milvus`` backend.
+
+        Defaults to ``None`` so selecting Milvus uses per-palace Milvus Lite at
+        ``<palace>/milvus.db``. Set this only to deliberately use a shared
+        Milvus server, Zilliz Cloud, or a custom local Lite file.
+        """
+        env_val = os.environ.get("MEMPALACE_MILVUS_URI")
+        if env_val:
+            return env_val.strip()
+        value = self._file_config.get("milvus_uri")
+        return str(value).strip() if value else None
+
+    @property
+    def milvus_token(self):
+        """Token for the opt-in ``milvus`` backend, if configured."""
+        env_val = os.environ.get("MEMPALACE_MILVUS_TOKEN")
+        if env_val:
+            return env_val
+        value = self._file_config.get("milvus_token")
+        return str(value) if value else None
+
+    @property
+    def milvus_namespace(self):
+        """Optional Milvus collection namespace/prefix."""
+        env_val = os.environ.get("MEMPALACE_MILVUS_NAMESPACE")
+        if env_val:
+            return env_val.strip()
+        value = self._file_config.get("milvus_namespace")
+        return str(value).strip() if value else None
+
+    @property
     def pgvector_dsn(self):
         """Postgres DSN for the opt-in ``pgvector`` backend.
 

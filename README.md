@@ -109,15 +109,24 @@ CUDA-accelerated embeddings, build the GPU variant with
 ## Storage backends
 
 ChromaDB is the default. For the pluggable-backend preview, MemPalace also
-ships `sqlite_exact` for local exact-vector correctness checks, and two opt-in
-external service backends — `qdrant` (REST) and `pgvector` (Postgres). The two
-external backends exercise the storage contract on different substrates (a
-REST/dict store and a SQL/JSONB store), so it is not accidentally shaped around
-one vendor.
+ships `sqlite_exact` for local exact-vector correctness checks, `milvus`
+(Milvus Lite by default, Milvus server / Zilliz Cloud when configured), and two
+other opt-in external service backends — `qdrant` (REST) and `pgvector`
+(Postgres). These backends exercise the storage contract on different
+substrates, so it is not accidentally shaped around one vendor.
 
 ```bash
 # local no-service backend
 mempalace mine ~/projects/myapp --backend sqlite_exact
+
+# Milvus backend, defaulting to per-palace Milvus Lite at <palace>/milvus.db
+#   needs the optional driver: pip install mempalace[milvus]
+mempalace mine ~/projects/myapp --backend milvus
+
+# Zilliz Cloud or Milvus server
+MEMPALACE_MILVUS_URI=https://your-cluster.api.region.zillizcloud.com \
+MEMPALACE_MILVUS_TOKEN=your-token \
+  mempalace mine ~/projects/myapp --backend milvus
 
 # Qdrant backend, defaulting to http://localhost:6333
 MEMPALACE_QDRANT_URL=http://localhost:6333 \
@@ -130,17 +139,18 @@ MEMPALACE_PGVECTOR_DSN=postgresql://localhost:5432/mempalace \
   mempalace mine ~/projects/myapp --backend pgvector
 ```
 
-Qdrant can also be configured with `MEMPALACE_QDRANT_API_KEY`,
-`MEMPALACE_QDRANT_NAMESPACE`, and `MEMPALACE_QDRANT_TIMEOUT`; pgvector with
-`MEMPALACE_PGVECTOR_NAMESPACE`. Both external backends isolate tenants by
-namespace (advertised via the `supports_namespace_isolation` capability) and
-write a local marker (`qdrant_backend.json` / `pgvector_backend.json`) to guard
-against silently opening a palace against the wrong server.
+Milvus can also be configured with `MEMPALACE_MILVUS_NAMESPACE`; Qdrant with
+`MEMPALACE_QDRANT_API_KEY`, `MEMPALACE_QDRANT_NAMESPACE`, and
+`MEMPALACE_QDRANT_TIMEOUT`; pgvector with `MEMPALACE_PGVECTOR_NAMESPACE`.
+The server-capable backends isolate tenants by namespace (advertised via the
+`supports_namespace_isolation` capability) and write a local marker
+(`milvus_backend.json` / `qdrant_backend.json` / `pgvector_backend.json`) to
+guard against silently opening a palace against the wrong server.
 
-When `MEMPALACE_QDRANT_URL` or `MEMPALACE_PGVECTOR_DSN` points anywhere other
-than your own local or trusted self-hosted service, MemPalace will send and
-store verbatim drawer text and metadata there. That is an explicit opt-in
-backend choice, never the default.
+When `MEMPALACE_MILVUS_URI`, `MEMPALACE_QDRANT_URL`, or `MEMPALACE_PGVECTOR_DSN`
+points anywhere other than your own local or trusted
+self-hosted service, MemPalace will send and store verbatim drawer text and
+metadata there. That is an explicit opt-in backend choice, never the default.
 
 ## Quickstart
 

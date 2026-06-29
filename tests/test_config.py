@@ -70,6 +70,27 @@ def test_qdrant_config_from_env_and_file(tmp_path, monkeypatch):
     assert cfg.qdrant_timeout == 3.5
 
 
+def test_milvus_config_from_env_and_file(tmp_path, monkeypatch):
+    with open(tmp_path / "config.json", "w") as f:
+        json.dump(
+            {
+                "milvus_uri": "https://config.example",
+                "milvus_token": "config-token",
+                "milvus_namespace": "config-ns",
+            },
+            f,
+        )
+    monkeypatch.setenv("MEMPALACE_MILVUS_URI", "https://env.example")
+    monkeypatch.setenv("MEMPALACE_MILVUS_TOKEN", "env-token")
+    monkeypatch.setenv("MEMPALACE_MILVUS_NAMESPACE", "env-ns")
+
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+
+    assert cfg.milvus_uri == "https://env.example"
+    assert cfg.milvus_token == "env-token"
+    assert cfg.milvus_namespace == "env-ns"
+
+
 def test_set_backend_persists_choice(tmp_path):
     cfg = MempalaceConfig(config_dir=str(tmp_path))
     cfg.set_backend("sqlite_exact")

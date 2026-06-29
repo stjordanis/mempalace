@@ -32,6 +32,7 @@ non-default backend is opt-in.
 | ------- | ---- | ------- | :--------: | :-----: |
 | `chroma` _(default)_ | Local (embedded) | bundled | – | ✓ |
 | `sqlite_exact` | Local (exact) | bundled | – | ✓ |
+| `milvus` | Local (Lite) · Server opt-in | `mempalace[milvus]` | ✓ | ✓ |
 | `qdrant` | Server (REST) | bundled | ✓ | ✓ |
 | `pgvector` | Server (Postgres) | `mempalace[pgvector]` | ✓ | ✓ |
 <!-- New backends add one row here and one `### <Backend>` subsection (with its connection variables) below; keep README's compatibility table in sync. -->
@@ -61,6 +62,21 @@ The default. Local, embedded, no service to run. Drawers are stored at
 Local and built-in (no extra to install). Runs exact cosine over every row — no
 ANN index — so it is the reference for exact-vector correctness checks and small
 palaces. Select with `--backend sqlite_exact`; it has no connection settings.
+
+### Milvus
+
+A Milvus backend using `pymilvus`. Install the optional driver with
+`pip install mempalace[milvus]`. When `MEMPALACE_MILVUS_URI` is unset,
+MemPalace uses per-palace Milvus Lite at `<palace>/milvus.db`; set a server or
+Zilliz Cloud URI to use a shared Milvus deployment.
+
+| Variable | Default | Description |
+| -------- | ------- | ----------- |
+| `MEMPALACE_MILVUS_URI` | per-palace Milvus Lite | Milvus server / Zilliz Cloud URI |
+| `MEMPALACE_MILVUS_TOKEN` | _(none)_ | Token for Milvus server / Zilliz Cloud |
+| `MEMPALACE_MILVUS_DB_NAME` | _(none)_ | Optional Milvus database name |
+| `MEMPALACE_MILVUS_NAMESPACE` | _(none)_ | Collection namespace prefix (tenant isolation) |
+| `MEMPALACE_MILVUS_CONSISTENCY_LEVEL` | `Strong` | Milvus consistency level (`Strong`, `Session`, `Bounded`, `Eventually`) |
 
 ### Qdrant
 
