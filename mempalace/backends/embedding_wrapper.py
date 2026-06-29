@@ -155,7 +155,9 @@ class EmbeddingCollection(BaseCollection):
     def lexical_search(self, *, query: str, n_results: int = 10, where: Optional[dict] = None):
         return self._inner.lexical_search(query=query, n_results=n_results, where=where)
 
-    def facet_counts(self, field: str, where: Optional[dict] = None, limit: int = 1000):
+    def facet_counts(
+        self, field: str, where: Optional[dict] = None, limit: int = 1000
+    ) -> dict[str, int]:
         # ``BaseCollection.facet_counts`` is a concrete method that raises
         # ``UnsupportedCapabilityError`` as its default. MRO resolves it on
         # this subclass before ``__getattr__`` ever fires, so without an
