@@ -28,8 +28,8 @@ pluggable backend contract, exercised across deliberately different substrates
 store) so the contract is never accidentally shaped around one vendor. Every
 non-default backend is opt-in.
 
-| Backend | Mode | Install | Namespace isolation | Lexical search | Configure with |
-| ------- | ---- | ------- | :-----------------: | :------------: | -------------- |
+| Backend | Mode | Install | Namespaces | Lexical | Configure with |
+| ------- | ---- | ------- | :--------: | :-----: | -------------- |
 | `chroma` _(default)_ | Local (embedded) | bundled | – | ✓ | `palace_path` |
 | `sqlite_exact` | Local (exact cosine) | bundled | – | ✓ | `palace_path` |
 | `qdrant` | Server (REST) | bundled | ✓ | ✓ | `MEMPALACE_QDRANT_URL` |

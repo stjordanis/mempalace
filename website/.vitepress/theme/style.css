@@ -165,8 +165,11 @@
 /* ── Tables ─────────────────────────────────────────────────────────── */
 
 .vp-doc table {
+  display: block;
+  /* Keep VitePress's horizontal scroll for wide tables; `overflow: hidden`
+     here would clip columns that don't fit the content column instead. */
+  overflow-x: auto;
   border-radius: 8px;
-  overflow: hidden;
 }
 
 .vp-doc th {
