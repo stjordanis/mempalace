@@ -22,7 +22,11 @@ from typing import Any, Optional
 
 import numpy as np
 
-from ..config import DEFAULT_MILVUS_CONSISTENCY_LEVEL, strip_lone_surrogates
+from ..config import (
+    DEFAULT_MILVUS_CONSISTENCY_LEVEL,
+    normalize_milvus_consistency_level,
+    strip_lone_surrogates,
+)
 from ._sidecar import EMBEDDER_SIDECAR_FILENAME, read_embedder_sidecar, write_embedder_sidecar
 from .base import (
     BackendClosedError,
@@ -48,13 +52,6 @@ logger = logging.getLogger(__name__)
 DEFAULT_DB_FILENAME = "milvus.db"
 _MARKER_FILENAME = "milvus_backend.json"
 _MAX_QUERY_WINDOW = 16384
-_MILVUS_CONSISTENCY_LEVELS = {
-    "strong": "Strong",
-    "session": "Session",
-    "bounded": "Bounded",
-    "eventually": "Eventually",
-}
-
 FIELD_ID = "id"
 FIELD_DOCUMENT = "document"
 FIELD_METADATA = "metadata"
@@ -73,6 +70,7 @@ RESERVED_FIELDS = {
 }
 
 _FIELD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -229,6 +227,10 @@ def _clean_text(value: Any) -> str:
     return strip_lone_surrogates(text).replace("\x00", "")
 
 
+def _utf8_len(value: str) -> int:
+    return len(value.encode("utf-8"))
+
+
 def _jsonable_metadata(meta: dict | None) -> dict:
     cleaned = {}
     for key, value in (meta or {}).items():
@@ -250,15 +252,6 @@ def _slug(value: str, fallback: str = "collection") -> str:
         return safe
     digest = sha256(value.encode("utf-8", errors="surrogatepass")).hexdigest()[:12]
     return f"{safe[:107]}_{digest}"
-
-
-def _normalize_consistency_level(value: Any) -> str:
-    raw = DEFAULT_MILVUS_CONSISTENCY_LEVEL if value is None else str(value).strip()
-    normalized = _MILVUS_CONSISTENCY_LEVELS.get(raw.lower())
-    if normalized:
-        return normalized
-    allowed = ", ".join(_MILVUS_CONSISTENCY_LEVELS.values())
-    raise BackendError(f"milvus consistency_level must be one of: {allowed}")
 
 
 @dataclass(frozen=True)
@@ -299,11 +292,15 @@ class _MilvusConfig:
             or os.environ.get("MEMPALACE_MILVUS_NAMESPACE")
             or getattr(cfg, "milvus_namespace", None)
         )
-        consistency_level = (
-            options.get("consistency_level")
-            or os.environ.get("MEMPALACE_MILVUS_CONSISTENCY_LEVEL")
-            or getattr(cfg, "milvus_consistency_level", DEFAULT_MILVUS_CONSISTENCY_LEVEL)
-        )
+        try:
+            consistency_level = (
+                options.get("consistency_level")
+                or os.environ.get("MEMPALACE_MILVUS_CONSISTENCY_LEVEL")
+                or getattr(cfg, "milvus_consistency_level", DEFAULT_MILVUS_CONSISTENCY_LEVEL)
+            )
+            consistency_level = normalize_milvus_consistency_level(consistency_level)
+        except ValueError as exc:
+            raise BackendError(str(exc)) from exc
         db_filename = options.get("db_filename") or DEFAULT_DB_FILENAME
         return cls(
             uri=str(uri).strip() if uri else None,
@@ -311,7 +308,7 @@ class _MilvusConfig:
             db_name=str(db_name).strip() if db_name else None,
             namespace=str(namespace).strip() if namespace else None,
             db_filename=str(db_filename).strip() or DEFAULT_DB_FILENAME,
-            consistency_level=_normalize_consistency_level(consistency_level),
+            consistency_level=consistency_level,
         )
 
 
@@ -356,6 +353,14 @@ class MilvusCollection(BaseCollection):
     @property
     def distance_metric(self) -> str:
         return "cosine"
+
+    def _vector_score_to_distance(self, score: Any) -> float:
+        if score is None:
+            return 1.0
+        value = float(score)
+        if self._config.uri and _is_server_uri(self._config.uri):
+            return 1.0 - max(-1.0, min(1.0, value))
+        return value
 
     def _remote_dimension(self) -> Optional[int]:
         if not self._remote_exists():
@@ -497,14 +502,16 @@ class MilvusCollection(BaseCollection):
         ):
             if not isinstance(doc_id, str) or not doc_id:
                 raise ValueError(f"row {idx}: id must be a non-empty string")
-            if len(doc_id) > DRAWER_ID_MAX_LENGTH:
+            doc_id_bytes = _utf8_len(doc_id)
+            if doc_id_bytes > DRAWER_ID_MAX_LENGTH:
                 raise ValueError(
-                    f"row {idx}: id length {len(doc_id)} exceeds {DRAWER_ID_MAX_LENGTH}"
+                    f"row {idx}: id byte length {doc_id_bytes} exceeds {DRAWER_ID_MAX_LENGTH}"
                 )
             document = _clean_text(document)
-            if len(document) > DOCUMENT_MAX_LENGTH:
+            document_bytes = _utf8_len(document)
+            if document_bytes > DOCUMENT_MAX_LENGTH:
                 raise ValueError(
-                    f"row {idx}: document length {len(document)} exceeds "
+                    f"row {idx}: document byte length {document_bytes} exceeds "
                     f"Milvus VARCHAR limit {DOCUMENT_MAX_LENGTH}; chunk before storing"
                 )
             row = {
@@ -536,6 +543,7 @@ class MilvusCollection(BaseCollection):
                 raise ValueError(f"ids already exist in milvus collection: {existing.ids}")
         self._ensure_remote_collection(dimension)
         self._client.insert(collection_name=self._remote_collection, data=rows)
+        self._backend._write_marker(self._palace, self._config)
 
     def upsert(self, *, documents, ids, metadatas=None, embeddings=None):
         if embeddings is None:
@@ -550,6 +558,7 @@ class MilvusCollection(BaseCollection):
             return
         self._ensure_remote_collection(dimension)
         self._client.upsert(collection_name=self._remote_collection, data=rows)
+        self._backend._write_marker(self._palace, self._config)
 
     def update(self, *, ids, documents=None, metadatas=None, embeddings=None):
         if documents is None and metadatas is None and embeddings is None:
@@ -568,23 +577,28 @@ class MilvusCollection(BaseCollection):
             for i, rid in enumerate(existing.ids)
             if existing.embeddings is not None
         }
-        missing = [doc_id for doc_id in ids if doc_id not in by_id]
-        if missing:
-            raise KeyError(f"update: ids not found: {missing}")
+        out_ids = []
         out_docs = []
         out_metas = []
         out_embeddings = []
         for idx, doc_id in enumerate(ids):
+            if doc_id not in by_id:
+                continue
             prev_doc, prev_meta, prev_embedding = by_id[doc_id]
+            out_ids.append(doc_id)
             out_docs.append(documents[idx] if documents is not None else prev_doc)
             meta = dict(prev_meta or {})
             if metadatas is not None:
                 meta.update(metadatas[idx] or {})
             out_metas.append(meta)
             out_embeddings.append(embeddings[idx] if embeddings is not None else prev_embedding)
-        self.upsert(
-            documents=out_docs, ids=list(ids), metadatas=out_metas, embeddings=out_embeddings
-        )
+        if out_ids:
+            self.upsert(
+                documents=out_docs,
+                ids=out_ids,
+                metadatas=out_metas,
+                embeddings=out_embeddings,
+            )
 
     def query(
         self,
@@ -653,7 +667,9 @@ class MilvusCollection(BaseCollection):
                 [self._extract_metadata(row) for row in rows] if spec.metadatas else []
             )
             outer_dists.append(
-                [float(row.get("distance", 1.0)) for row in rows] if spec.distances else []
+                [self._vector_score_to_distance(row.get("distance")) for row in rows]
+                if spec.distances
+                else []
             )
             if spec.embeddings:
                 outer_embeddings.append([row.get(FIELD_VECTOR) or [] for row in rows])

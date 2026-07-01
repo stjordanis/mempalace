@@ -97,6 +97,14 @@ def test_milvus_config_from_env_and_file(tmp_path, monkeypatch):
     assert cfg.milvus_consistency_level == "Eventually"
 
 
+def test_milvus_config_rejects_invalid_consistency_level(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEMPALACE_MILVUS_CONSISTENCY_LEVEL", "linearizable")
+    cfg = MempalaceConfig(config_dir=str(tmp_path))
+
+    with pytest.raises(ValueError, match="milvus_consistency_level"):
+        cfg.milvus_consistency_level
+
+
 def test_set_backend_persists_choice(tmp_path):
     cfg = MempalaceConfig(config_dir=str(tmp_path))
     cfg.set_backend("sqlite_exact")

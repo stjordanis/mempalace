@@ -15,7 +15,12 @@ from mempalace.backends import (
     UnsupportedFilterError,
     available_backends,
 )
-from mempalace.backends.milvus import MilvusBackend, translate_where, translate_where_document
+from mempalace.backends.milvus import (
+    DOCUMENT_MAX_LENGTH,
+    MilvusBackend,
+    translate_where,
+    translate_where_document,
+)
 
 
 def _require_milvus_lite():
@@ -129,8 +134,9 @@ def test_milvus_lite_upsert_update_delete_get_order_and_multi_collection(tmp_pat
         assert got.ids == ["two", "one", "two"]
         assert got.documents == ["second document", "first document", "second document"]
 
-        drawers.update(ids=["one"], metadatas=[{"room": "updated"}])
+        drawers.update(ids=["one", "missing"], metadatas=[{"room": "updated"}, {"room": "skip"}])
         assert drawers.get(ids=["one"]).metadatas == [{"wing": "a", "room": "updated"}]
+        assert drawers.get(ids=["missing"]).ids == []
 
         drawers.delete(where={"wing": "b"})
         assert drawers.get().ids == ["one"]
@@ -192,10 +198,46 @@ def test_milvus_lite_dimension_and_validation_errors(tmp_path):
             col.add(ids=["reserved"], documents=["x"], metadatas=[{"id": "x"}], embeddings=[[1, 0]])
         with pytest.raises(ValueError, match="delete requires"):
             col.delete()
-        with pytest.raises(KeyError):
-            col.update(ids=["missing"], metadatas=[{"wing": "x"}])
+        with pytest.raises(ValueError, match="document byte length"):
+            col.add(
+                ids=["long"], documents=["你" * (DOCUMENT_MAX_LENGTH // 3 + 1)], embeddings=[[1, 0]]
+            )
     finally:
         backend.close()
+
+
+def test_milvus_writes_marker_when_upserting_existing_remote_collection(tmp_path):
+    _require_milvus_lite()
+    shared_uri = str(tmp_path / "shared.db")
+
+    backend_a = MilvusBackend()
+    palace_a = PalaceRef(id="palace-a", local_path=str(tmp_path / "palace-a"))
+    col_a = backend_a.get_collection(
+        palace=palace_a,
+        collection_name="drawers",
+        create=True,
+        options={"uri": shared_uri},
+    )
+    try:
+        col_a.upsert(ids=["a"], documents=["first"], embeddings=[[1, 0]])
+    finally:
+        backend_a.close()
+
+    backend_b = MilvusBackend()
+    palace_b = PalaceRef(id="palace-b", local_path=str(tmp_path / "palace-b"))
+    marker_b = os.path.join(palace_b.local_path, "milvus_backend.json")
+    col_b = backend_b.get_collection(
+        palace=palace_b,
+        collection_name="drawers",
+        create=True,
+        options={"uri": shared_uri},
+    )
+    try:
+        assert not os.path.exists(marker_b)
+        col_b.upsert(ids=["b"], documents=["second"], embeddings=[[0, 1]])
+        assert os.path.isfile(marker_b)
+    finally:
+        backend_b.close()
 
 
 def test_milvus_marker_rejects_remote_target_change(tmp_path, monkeypatch):
@@ -305,6 +347,14 @@ def test_milvus_zilliz_cloud_roundtrip_when_enabled(tmp_path):
             where={"wing": "live"},
         )
         assert result.ids == [["cloud-a"]]
+
+        ranked = col.query(
+            query_embeddings=[[1.0, 0.0]],
+            n_results=2,
+            include=["distances"],
+        )
+        assert ranked.ids == [["cloud-a", "cloud-b"]]
+        assert ranked.distances[0] == pytest.approx([0.0, 1.0])
 
         hits = col.lexical_search(query="rareterm", n_results=1).hits
         assert hits and hits[0].id == "cloud-a"

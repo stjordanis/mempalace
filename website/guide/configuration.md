@@ -28,13 +28,13 @@ pluggable backend contract, exercised across deliberately different substrates
 store) so the contract is never accidentally shaped around one vendor. Every
 non-default backend is opt-in.
 
-| Backend | Mode | Install | Namespaces | Lexical |
-| ------- | ---- | ------- | :--------: | :-----: |
-| `chroma` _(default)_ | Local (embedded) | bundled | – | ✓ |
-| `sqlite_exact` | Local (exact) | bundled | – | ✓ |
-| `milvus` | Local (Lite) · Server opt-in | `mempalace[milvus]` | ✓ | ✓ |
-| `qdrant` | Server (REST) | bundled | ✓ | ✓ |
-| `pgvector` | Server (Postgres) | `mempalace[pgvector]` | ✓ | ✓ |
+| Backend | Mode | Install | Namespaces | Lexical | Configure with |
+| ------- | ---- | ------- | :--------: | :-----: | -------------- |
+| `chroma` _(default)_ | Local (embedded) | bundled | – | ✓ | – |
+| `sqlite_exact` | Local (exact) | bundled | – | ✓ | – |
+| `milvus` | Local (Lite) · Server opt-in | `mempalace[milvus]` | ✓ | ✓ | `MEMPALACE_MILVUS_URI` |
+| `qdrant` | Server (REST) | bundled | ✓ | ✓ | `MEMPALACE_QDRANT_URL` |
+| `pgvector` | Server (Postgres) | `mempalace[pgvector]` | ✓ | ✓ | `MEMPALACE_PGVECTOR_DSN` |
 <!-- New backends add one row here and one `### <Backend>` subsection (with its connection variables) below; keep README's compatibility table in sync. -->
 
 Select a backend with `--backend <name>` on any `mempalace` / `mempalace-mcp`

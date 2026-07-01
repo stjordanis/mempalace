@@ -212,9 +212,13 @@ _MILVUS_CONSISTENCY_LEVELS = {
 DEFAULT_MAX_BACKUPS = 10
 
 
-def _normalize_milvus_consistency_config(value) -> str:
+def normalize_milvus_consistency_level(value) -> str:
     raw = str(value).strip() if value else DEFAULT_MILVUS_CONSISTENCY_LEVEL
-    return _MILVUS_CONSISTENCY_LEVELS.get(raw.lower(), raw)
+    normalized = _MILVUS_CONSISTENCY_LEVELS.get(raw.lower())
+    if normalized:
+        return normalized
+    allowed = ", ".join(_MILVUS_CONSISTENCY_LEVELS.values())
+    raise ValueError(f"milvus_consistency_level must be one of: {allowed}")
 
 
 def sqlite_read_uri(db_path: str) -> str:
@@ -479,9 +483,9 @@ class MempalaceConfig:
         """Milvus read consistency level for the opt-in ``milvus`` backend."""
         env_val = os.environ.get("MEMPALACE_MILVUS_CONSISTENCY_LEVEL")
         if env_val:
-            return _normalize_milvus_consistency_config(env_val)
+            return normalize_milvus_consistency_level(env_val)
         value = self._file_config.get("milvus_consistency_level")
-        return _normalize_milvus_consistency_config(value)
+        return normalize_milvus_consistency_level(value)
 
     @property
     def pgvector_dsn(self):
