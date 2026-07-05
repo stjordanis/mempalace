@@ -2009,13 +2009,25 @@ def _make_fts5_palace(tmp_path, *, corrupt: bool) -> str:
 
 def test_errors_are_isolated_fts5_classification():
     fts = "malformed inverted index for FTS5 table main.embedding_fulltext_search"
+    # SQLite >= ~3.5x (confirmed on 3.53.2 / Python 3.13.7) reports isolated
+    # FTS5 corruption with this wording instead of the older phrasing above.
+    # A regex matching only the old phrasing silently declines to auto-heal
+    # on any machine running a newer SQLite -- caught by this repo's own
+    # test_maybe_autoheal_fts5_index_heals_isolated_corruption failing on
+    # this exact build before _FTS5_MALFORMED_RE was widened to cover both.
+    fts_new = (
+        'fts5: corruption found reading blob 137438953474 from table "embedding_fulltext_search"'
+    )
     page = "Page 4 of B-tree 12345: database disk image is malformed"
     assert repair._errors_are_isolated_fts5([fts])
     assert repair._errors_are_isolated_fts5([fts, fts])
+    assert repair._errors_are_isolated_fts5([fts_new])
+    assert repair._errors_are_isolated_fts5([fts, fts_new])
     assert not repair._errors_are_isolated_fts5([])
     assert not repair._errors_are_isolated_fts5([page])
     # Any non-FTS5 error in the set means the data itself may be damaged.
     assert not repair._errors_are_isolated_fts5([fts, page])
+    assert not repair._errors_are_isolated_fts5([fts_new, page])
 
 
 def test_maybe_autoheal_fts5_index_heals_isolated_corruption(tmp_path):
