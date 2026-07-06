@@ -373,6 +373,8 @@ _MUTATING_TOOLS = frozenset(
         "mempalace_delete_hallway",
         "mempalace_add_drawer",
         "mempalace_delete_drawer",
+        "mempalace_checkpoint",
+        "mempalace_delete_by_source",
         "mempalace_mine",
         "mempalace_sync",
         "mempalace_update_drawer",
