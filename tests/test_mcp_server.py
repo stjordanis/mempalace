@@ -2860,6 +2860,27 @@ class TestKGTools:
         # not silently drop it and return the literal string "today".
         assert result["ended"] == "2026-03-01"
 
+    def test_kg_supersede(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace.mcp_server import tool_kg_supersede
+
+        kg.add_triple("Bot", "uses_model", "old", valid_from="2026-05-01")
+        result = tool_kg_supersede(
+            subject="Bot",
+            predicate="uses_model",
+            old_object="old",
+            new_object="new",
+            at="2026-06-02",
+        )
+        assert result["success"] is True
+        assert result["superseded"] == "old"
+        models = [
+            f["object"]
+            for f in kg.query_entity("Bot", as_of="2026-06-02", direction="outgoing")
+            if f["predicate"] == "uses_model"
+        ]
+        assert models == ["new"]
+
     def test_kg_add_forwards_valid_to(self, monkeypatch, config, palace_path, kg):
         """Regression #1314 case 1: valid_to must round-trip through kg_add."""
         _patch_mcp_server(monkeypatch, config, kg)
