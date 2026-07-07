@@ -951,7 +951,11 @@ def _validate_palace_fts5_after_mine(palace_path: str) -> None:
 
     errors = sqlite_integrity_errors(palace_path)
     if errors:
-        errors = maybe_autoheal_fts5_index(palace_path, errors)
+        # progress=logger.info, not the default print: this runs inside the
+        # MCP server process too (mcp_server.tool_mine -> miner.mine), where
+        # stdout is the JSON-RPC transport -- a stray print() here would
+        # corrupt the protocol stream and crash the connection.
+        errors = maybe_autoheal_fts5_index(palace_path, errors, progress=logger.info)
     if errors:
         raise MineValidationError(palace_path, errors)
 

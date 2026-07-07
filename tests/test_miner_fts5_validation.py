@@ -362,6 +362,108 @@ def test_full_chain_auto_heals_isolated_fts5_corruption(tmp_path):
     )
 
 
+def test_validator_suppresses_raise_when_autoheal_clears(tmp_path, monkeypatch):
+    """Build-independent companion to test_full_chain_auto_heals_isolated_fts5_corruption.
+
+    _corrupt_fts5_segment pytest.skips on SQLite builds that refuse direct
+    FTS5 shadow-table writes, so on those builds the auto-heal wiring is
+    never actually exercised. Stubbing sqlite_integrity_errors and
+    maybe_autoheal_fts5_index directly (rather than fabricating real
+    corruption) proves the wiring in _validate_palace_fts5_after_mine itself,
+    deterministically, on every build.
+    """
+    from mempalace import repair as repair_mod
+
+    palace = tmp_path / "palace"
+    _build_palace_with_drawer(palace)
+
+    fts_error = ["malformed inverted index for FTS5 table main.embedding_fulltext_search"]
+    heal_calls = []
+
+    monkeypatch.setattr(repair_mod, "sqlite_integrity_errors", lambda _p: list(fts_error))
+
+    def _fake_heal(palace_path, errors, **_kwargs):
+        heal_calls.append((palace_path, tuple(errors)))
+        return []  # healed: no remaining errors
+
+    monkeypatch.setattr(repair_mod, "maybe_autoheal_fts5_index", _fake_heal)
+
+    _validate_palace_fts5_after_mine(str(palace))  # must not raise
+
+    assert heal_calls == [(str(palace), tuple(fts_error))]
+
+
+def test_validator_passes_logger_progress_not_print_to_autoheal(tmp_path, monkeypatch, capsys):
+    """The actual review-comment fix (gemini-code-assist, PR #1928): this
+    validator runs inside the MCP server process too (mcp_server.tool_mine ->
+    miner.mine), where stdout is the JSON-RPC transport. maybe_autoheal_fts5_index
+    defaults to progress=print, so _validate_palace_fts5_after_mine must
+    override it with a logging call instead -- otherwise a healed mine would
+    print raw progress text onto the transport stream mid-response.
+
+    The two tests above only prove the suppress/raise wiring and would pass
+    even if this line still defaulted to print (they mock
+    maybe_autoheal_fts5_index entirely, discarding whatever kwargs it's
+    called with). This test instead captures the actual kwargs passed and
+    invokes the captured progress callable, asserting nothing lands on stdout.
+
+    Deliberately not pinned to logger.info specifically: which severity level
+    is used is a verbosity choice, not a correctness requirement -- the bug
+    was "raw print() to stdout", not "wrong log level". Asserting equality to
+    one specific level method would make the test fail on a reasonable future
+    change (e.g. to logger.debug) that doesn't reintroduce the actual bug.
+    """
+    from mempalace import repair as repair_mod
+    from mempalace.palace import logger as palace_logger
+
+    palace = tmp_path / "palace"
+    _build_palace_with_drawer(palace)
+
+    fts_error = ["malformed inverted index for FTS5 table main.embedding_fulltext_search"]
+    captured_kwargs = {}
+
+    monkeypatch.setattr(repair_mod, "sqlite_integrity_errors", lambda _p: list(fts_error))
+
+    def _fake_heal(palace_path, errors, **kwargs):
+        captured_kwargs.update(kwargs)
+        kwargs.get("progress", print)("probe progress message")
+        return []
+
+    monkeypatch.setattr(repair_mod, "maybe_autoheal_fts5_index", _fake_heal)
+
+    _validate_palace_fts5_after_mine(str(palace))
+
+    progress = captured_kwargs.get("progress")
+    assert progress is not None
+    assert progress is not print
+    # Any severity is fine; what matters is that it's a bound method of this
+    # module's own logger (routed through logging), not the raw print builtin.
+    assert getattr(progress, "__self__", None) is palace_logger
+    out, _ = capsys.readouterr()
+    assert out == ""
+
+
+def test_validator_still_raises_when_autoheal_cannot_clear(tmp_path, monkeypatch):
+    """Auto-heal is a best-effort first attempt, not a reason to swallow real
+    corruption: when maybe_autoheal_fts5_index can't clear the condition
+    (broader corruption, lock contention, rebuild failure), the validator
+    must still raise. Same build-independence rationale as the test above.
+    """
+    from mempalace import repair as repair_mod
+
+    palace = tmp_path / "palace"
+    _build_palace_with_drawer(palace)
+
+    errors = ["database disk image is malformed"]
+    monkeypatch.setattr(repair_mod, "sqlite_integrity_errors", lambda _p: list(errors))
+    monkeypatch.setattr(
+        repair_mod, "maybe_autoheal_fts5_index", lambda palace_path, errs, **_kwargs: errs
+    )
+
+    with pytest.raises(MineValidationError):
+        _validate_palace_fts5_after_mine(str(palace))
+
+
 def test_mine_impl_does_not_print_partial_summary_on_validation_error(
     tmp_path, capsys, monkeypatch
 ):
