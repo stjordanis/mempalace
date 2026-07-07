@@ -452,6 +452,29 @@ def is_force_included(path: Path, project_path: Path, include_paths: set) -> boo
     return False
 
 
+def _apply_exclude_patterns_to_prescanned_files(
+    files: list, project_path: Path, exclude_patterns: list, include_ignored: list
+) -> list:
+    """Filter a caller-provided (already-scanned) file list by exclude_patterns.
+
+    scan_project() applies exclude_patterns itself, but a caller that passes
+    its own pre-scanned ``files`` list bypasses that -- so callers reusing a
+    scan (e.g. the init double-scan) still need per-project exclusions
+    applied here. force_include paths are preserved, matching scan_project's
+    own precedence.
+    """
+    include_paths = normalize_include_paths(include_ignored)
+    exclude_matcher = GitignoreMatcher.from_patterns(project_path, exclude_patterns)
+    if exclude_matcher is None:
+        return files
+    return [
+        file_path
+        for file_path in files
+        if is_force_included(file_path, project_path, include_paths)
+        or exclude_matcher.matches(file_path, is_dir=False) is not True
+    ]
+
+
 # =============================================================================
 # CONFIG
 # =============================================================================
@@ -1764,18 +1787,9 @@ def _mine_impl(
             exclude_patterns=exclude_patterns,
         )
     elif exclude_patterns:
-        # The caller provided a pre-scanned file list, so scan_project never ran.
-        # Apply exclude_patterns here so that callers reusing a scan still get
-        # the same per-project exclusions.  force_include paths are preserved.
-        include_paths = normalize_include_paths(include_ignored)
-        exclude_matcher = GitignoreMatcher.from_patterns(project_path, exclude_patterns)
-        if exclude_matcher is not None:
-            files = [
-                file_path
-                for file_path in files
-                if is_force_included(file_path, project_path, include_paths)
-                or exclude_matcher.matches(file_path, is_dir=False) is not True
-            ]
+        files = _apply_exclude_patterns_to_prescanned_files(
+            files, project_path, exclude_patterns, include_ignored
+        )
 
     from .embedding import describe_device
 
