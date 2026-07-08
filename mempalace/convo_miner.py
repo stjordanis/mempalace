@@ -113,24 +113,34 @@ def _register_file(collection, source_file: str, wing: str, agent: str, extract_
     Without this, files that normalize to nothing or produce zero chunks are
     re-read and re-processed on every mine run because nothing was written to
     ChromaDB on the first pass.
+
+    Stamps source_mtime like every real drawer does, so a file that later
+    grows past the min-chunk-size floor (e.g. a short session that gets
+    extended) is correctly detected as changed on the next mine instead of
+    being skipped forever by this sentinel.
     """
+    try:
+        source_mtime = os.path.getmtime(source_file)
+    except OSError:
+        source_mtime = None
     sentinel_id = make_convo_sentinel_id(source_file, extract_mode)
+    meta = {
+        "wing": wing,
+        "room": "_registry",
+        "source_file": source_file,
+        "added_by": agent,
+        "filed_at": datetime.now().isoformat(),
+        "ingest_mode": "registry",
+        "extract_mode": extract_mode,
+        "normalize_version": NORMALIZE_VERSION,
+        "id_recipe": ID_RECIPE,
+    }
+    if source_mtime is not None:
+        meta["source_mtime"] = source_mtime
     collection.upsert(
         documents=[f"[registry] {source_file}"],
         ids=[sentinel_id],
-        metadatas=[
-            {
-                "wing": wing,
-                "room": "_registry",
-                "source_file": source_file,
-                "added_by": agent,
-                "filed_at": datetime.now().isoformat(),
-                "ingest_mode": "registry",
-                "extract_mode": extract_mode,
-                "normalize_version": NORMALIZE_VERSION,
-                "id_recipe": ID_RECIPE,
-            }
-        ],
+        metadatas=[meta],
     )
 
 
@@ -472,8 +482,12 @@ def _file_chunks_locked(
     """Lock the source file, purge stale drawers, and upsert fresh chunks.
 
     Combines the per-file serialization that prevents concurrent agents from
-    duplicating work (via mine_lock) with the normalize-version rebuild
-    contract (purge-before-insert so pre-v2 drawers don't survive).
+    duplicating work (via mine_lock) with the rebuild contract
+    (purge-before-insert so stale drawers never survive) that fires on
+    either a normalize-version bump OR a changed/grown source file (mtime
+    differs from what's stored) -- transcripts are not assumed immutable,
+    since a Claude Code session keeps appending to its own file while
+    active and /compact or /clear can rewrite one in place.
 
     Returns (drawers_added, room_counts_delta, skipped).
     """
@@ -481,14 +495,15 @@ def _file_chunks_locked(
     drawers_added = 0
     with mine_lock(source_file):
         # Re-check after lock — another agent may have just finished this file
-        # at the current schema. A stale-version hit here returns False, so we
+        # at the current schema/mtime. A stale hit here returns False, so we
         # still fall through to the purge+rebuild path below.
-        if file_already_mined(collection, source_file, extract_mode=extract_mode):
+        if file_already_mined(collection, source_file, check_mtime=True, extract_mode=extract_mode):
             return 0, room_counts_delta, True
 
-        # Purge stale drawers first. When the normalize schema bumps,
-        # file_already_mined() returned False for pre-v2 drawers — clean
-        # them out so the source doesn't end up with mixed old/new drawers.
+        # Purge stale drawers first. Fires both on a normalize-schema bump
+        # (file_already_mined() returned False for pre-v2 drawers) and on a
+        # changed/grown transcript (mtime differs) — clean them out so the
+        # source doesn't end up with mixed old/new drawers.
         try:
             delete_ids = _source_file_delete_ids(collection, source_file, extract_mode)
             if delete_ids:
@@ -501,6 +516,10 @@ def _file_chunks_locked(
         # one filed_at per source file so all transcript drawers share an
         # ingest timestamp.
         filed_at = datetime.now().isoformat()
+        try:
+            source_mtime = os.path.getmtime(source_file)
+        except OSError:
+            source_mtime = None
         for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
             batch_docs: list = []
             batch_ids: list = []
@@ -514,23 +533,24 @@ def _file_chunks_locked(
                 )
                 batch_docs.append(chunk["content"])
                 batch_ids.append(drawer_id)
-                batch_metas.append(
-                    {
-                        "wing": wing,
-                        "room": chunk_room,
-                        "hall": _detect_hall_cached(chunk["content"]),
-                        "source_file": source_file,
-                        "chunk_index": chunk["chunk_index"],
-                        "added_by": agent,
-                        "filed_at": filed_at,
-                        "entities": entities_metadata(chunk["content"]),
-                        "authored_at": authored_at if authored_at is not None else filed_at,
-                        "ingest_mode": "convos",
-                        "extract_mode": extract_mode,
-                        "normalize_version": NORMALIZE_VERSION,
-                        "id_recipe": ID_RECIPE,
-                    }
-                )
+                meta = {
+                    "wing": wing,
+                    "room": chunk_room,
+                    "hall": _detect_hall_cached(chunk["content"]),
+                    "source_file": source_file,
+                    "chunk_index": chunk["chunk_index"],
+                    "added_by": agent,
+                    "filed_at": filed_at,
+                    "entities": entities_metadata(chunk["content"]),
+                    "authored_at": authored_at if authored_at is not None else filed_at,
+                    "ingest_mode": "convos",
+                    "extract_mode": extract_mode,
+                    "normalize_version": NORMALIZE_VERSION,
+                    "id_recipe": ID_RECIPE,
+                }
+                if source_mtime is not None:
+                    meta["source_mtime"] = source_mtime
+                batch_metas.append(meta)
             assert_no_collisions(list(zip(batch_ids, batch_metas)), collection)
             try:
                 collection.upsert(
@@ -572,6 +592,28 @@ def _is_ai_tool_path(path: Path) -> bool:
         if parts[i] == ".claude" and parts[i + 1] == "projects":
             return True
     return False
+
+
+def _is_unchanged_since_last_mine(source_file: str, mined_mtimes: dict) -> bool:
+    """True iff source_file was mined at the current schema AND its on-disk
+    mtime still matches what was stored -- the mtime-aware replacement for
+    "we've seen this source_file before" (transcripts are not immutable).
+
+    False (re-mine) whenever the file isn't in mined_mtimes at all, its
+    stored mtime is None (never recorded -- pre-mtime-tracking drawer, or
+    getmtime failed when it was written), or getmtime fails right now
+    (treat as changed rather than silently trusting stale data).
+    """
+    if source_file not in mined_mtimes:
+        return False
+    stored_mtime = mined_mtimes[source_file]
+    if stored_mtime is None:
+        return False
+    try:
+        current_mtime = os.path.getmtime(source_file)
+    except OSError:
+        return False
+    return abs(stored_mtime - current_mtime) < 0.001
 
 
 def _resolve_wing(convo_path: Path, wing: Optional[str]) -> str:
@@ -712,13 +754,14 @@ def _mine_convos_impl(
 
     collection = get_collection(palace_path) if not dry_run else None
 
-    # Bulk pre-fetch already-mined set in one paginated pass instead of
-    # `len(files)` separate WHERE-source_file queries. On a 150k-drawer
-    # palace each per-file query costs ~2s, so a 2000-file sweep used to
-    # spend >1h just deciding to skip. prefetch_mined_set() does the same
-    # decisions in a single scan; loop body becomes an O(1) set check.
-    mined_set: set[str] = (
-        prefetch_mined_set(collection, extract_mode=extract_mode) if not dry_run else set()
+    # Bulk pre-fetch already-mined source_file -> stored mtime in one
+    # paginated pass instead of `len(files)` separate WHERE-source_file
+    # queries. On a 150k-drawer palace each per-file query costs ~2s, so a
+    # 2000-file sweep used to spend >1h just deciding to skip.
+    # prefetch_mined_set() does the same decisions in a single scan; loop
+    # body becomes an O(1) dict lookup + a cheap local mtime comparison.
+    mined_mtimes: dict = (
+        prefetch_mined_set(collection, extract_mode=extract_mode) if not dry_run else {}
     )
 
     total_drawers = 0
@@ -731,8 +774,15 @@ def _mine_convos_impl(
         files_processed = i
         source_file = str(filepath)
 
-        # Skip if already filed at current NORMALIZE_VERSION
-        if not dry_run and source_file in mined_set:
+        # Skip only if already filed at the current NORMALIZE_VERSION AND
+        # unchanged on disk since. Transcripts are NOT assumed immutable:
+        # a Claude Code session keeps appending to the same file while
+        # active, and /compact or /clear can rewrite one in place -- so
+        # "we've seen this source_file before" alone is not sufficient.
+        # Falling through re-mines: _file_chunks_locked purges this
+        # source_file's stale drawers before inserting fresh ones, so this
+        # never leaves duplicates behind.
+        if not dry_run and _is_unchanged_since_last_mine(source_file, mined_mtimes):
             files_skipped += 1
             continue
 
