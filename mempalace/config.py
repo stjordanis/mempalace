@@ -213,12 +213,28 @@ def sanitize_content(value: str, max_length: int = 100_000) -> str:
 DEFAULT_PALACE_PATH = os.path.expanduser("~/.mempalace/palace")
 DEFAULT_COLLECTION_NAME = "mempalace_drawers"
 DEFAULT_BACKEND = "chroma"
+DEFAULT_MILVUS_CONSISTENCY_LEVEL = "Strong"
+_MILVUS_CONSISTENCY_LEVELS = {
+    "strong": "Strong",
+    "session": "Session",
+    "bounded": "Bounded",
+    "eventually": "Eventually",
+}
 
 # How many timestamped palace backups to retain before the oldest are
 # pruned. Applies to the accumulating backups written by ``mempalace
 # migrate`` and ``mempalace repair max-seq-id`` — see
 # ``MempalaceConfig.max_backups``.
 DEFAULT_MAX_BACKUPS = 10
+
+
+def normalize_milvus_consistency_level(value) -> str:
+    raw = str(value).strip() if value else DEFAULT_MILVUS_CONSISTENCY_LEVEL
+    normalized = _MILVUS_CONSISTENCY_LEVELS.get(raw.lower())
+    if normalized:
+        return normalized
+    allowed = ", ".join(_MILVUS_CONSISTENCY_LEVELS.values())
+    raise ValueError(f"milvus_consistency_level must be one of: {allowed}")
 
 
 def sqlite_read_uri(db_path: str) -> str:
@@ -436,6 +452,56 @@ class MempalaceConfig:
         except (TypeError, ValueError):
             timeout = 10.0
         return timeout if timeout > 0 else 10.0
+
+    @property
+    def milvus_uri(self):
+        """Milvus endpoint for the opt-in ``milvus`` backend.
+
+        Defaults to ``None`` so selecting Milvus uses per-palace Milvus Lite at
+        ``<palace>/milvus.db``. Set this only to deliberately use a shared
+        Milvus server, Zilliz Cloud, or a custom local Lite file.
+        """
+        env_val = os.environ.get("MEMPALACE_MILVUS_URI")
+        if env_val:
+            return env_val.strip()
+        value = self._file_config.get("milvus_uri")
+        return str(value).strip() if value else None
+
+    @property
+    def milvus_token(self):
+        """Token for the opt-in ``milvus`` backend, if configured."""
+        env_val = os.environ.get("MEMPALACE_MILVUS_TOKEN")
+        if env_val:
+            return env_val
+        value = self._file_config.get("milvus_token")
+        return str(value) if value else None
+
+    @property
+    def milvus_db_name(self):
+        """Optional Milvus database name for the opt-in ``milvus`` backend."""
+        env_val = os.environ.get("MEMPALACE_MILVUS_DB_NAME")
+        if env_val:
+            return env_val.strip()
+        value = self._file_config.get("milvus_db_name")
+        return str(value).strip() if value else None
+
+    @property
+    def milvus_namespace(self):
+        """Optional Milvus collection namespace/prefix."""
+        env_val = os.environ.get("MEMPALACE_MILVUS_NAMESPACE")
+        if env_val:
+            return env_val.strip()
+        value = self._file_config.get("milvus_namespace")
+        return str(value).strip() if value else None
+
+    @property
+    def milvus_consistency_level(self):
+        """Milvus read consistency level for the opt-in ``milvus`` backend."""
+        env_val = os.environ.get("MEMPALACE_MILVUS_CONSISTENCY_LEVEL")
+        if env_val:
+            return normalize_milvus_consistency_level(env_val)
+        value = self._file_config.get("milvus_consistency_level")
+        return normalize_milvus_consistency_level(value)
 
     @property
     def pgvector_dsn(self):
