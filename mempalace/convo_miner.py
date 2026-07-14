@@ -65,6 +65,16 @@ CONVO_EXTENSIONS = {
     ".jsonl",
 }
 
+# Directories inside conversation sources that never hold conversations.
+# ``tool-results``: Claude Code pages large tool outputs to
+# ``<session>/tool-results/*.txt`` inside ``~/.claude/projects/<slug>/``.
+# They are raw machine dumps referenced from the transcript JSONL — mining
+# them stores megabytes of command output as "memories" (field measurement:
+# 12.8k drawers from tool-results files on one palace; a single file
+# produced 3.6k). Extends the generic SKIP_DIRS set for the convo scanner
+# only — project mining semantics are unchanged.
+CONVO_SKIP_DIRS = SKIP_DIRS | {"tool-results"}
+
 MIN_CHUNK_SIZE = 30
 CHUNK_SIZE = 800  # chars per drawer — align with miner.py
 _LINE_GROUP_SIZE = 25  # lines per fallback group when no paragraph breaks
@@ -395,7 +405,7 @@ def scan_convos(convo_dir: str) -> list:
     convo_path = Path(convo_dir).expanduser().resolve()
     files = []
     for root, dirs, filenames in os.walk(convo_path):
-        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        dirs[:] = [d for d in dirs if d not in CONVO_SKIP_DIRS]
         for filename in filenames:
             if filename.endswith(".meta.json"):
                 continue
