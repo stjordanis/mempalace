@@ -638,13 +638,24 @@ def print_sqlite_integrity_abort(palace_path: str, errors: list[str]) -> None:
     print("    6. Re-run `mempalace repair --yes`.")
 
 
-# quick_check labels a corrupt FTS5 inverted index like:
+# quick_check's wording for a corrupt FTS5 inverted index differs by SQLite
+# version — both forms describe the same recoverable condition:
 #   "malformed inverted index for FTS5 table main.embedding_fulltext_search"
-# That specific failure is recoverable in place: the index is derived from the
+#     (older SQLite)
+#   "fts5: corruption found reading blob N from table \"embedding_fulltext_search\""
+#     (SQLite >= ~3.5x, confirmed on 3.53.2 / Python 3.13.7 — the exact
+#     message this repo's own test fixture produces on that build)
+# Either failure is recoverable in place: the index is derived from the
 # intact ``embedding_fulltext_search_content`` shadow table, so rebuilding it
 # restores full-text search without touching any drawer rows. Concurrent
-# killed-mid-write mines are the usual cause (#1596).
-_FTS5_MALFORMED_RE = re.compile(r"malformed inverted index for FTS5 table", re.IGNORECASE)
+# killed-mid-write mines are the usual cause (#1596). A regex matching only
+# the older phrasing would silently decline to auto-heal on newer SQLite —
+# the exact failure this repo's own test suite caught (test_repair.py's two
+# auto-heal tests failed on this machine until this pattern was widened).
+_FTS5_MALFORMED_RE = re.compile(
+    r"malformed inverted index for fts5 table|fts5:\s*corruption found",
+    re.IGNORECASE,
+)
 
 
 def _errors_are_isolated_fts5(errors: list[str]) -> bool:
