@@ -1752,6 +1752,60 @@ def test_rebuild_from_sqlite_roundtrips_via_real_chromadb(tmp_path):
     assert closet_row["metadatas"][0] == {"wing": "alpha"}
 
 
+def test_rebuild_from_sqlite_rebuilds_fts5_after_chroma_closes(tmp_path, monkeypatch):
+    """The SQLite recovery path must finish by rebuilding Chroma's FTS5 index.
+
+    Large bulk upserts can leave the derived full-text index malformed even
+    when every source drawer survived.  The repair is not complete until the
+    Chroma client releases its SQLite handle and FTS5 is rebuilt.
+    """
+    source = tmp_path / "source"
+    dest = tmp_path / "dest"
+    _seed_palace(source, "mempalace_drawers", [("d1", "doc", {"wing": "w"})])
+
+    calls = []
+    real_rebuild = repair._vacuum_and_rebuild_fts5
+
+    def _spy(path, progress=print, *, strict=False):
+        calls.append((path, strict))
+        return real_rebuild(path, progress=progress, strict=strict)
+
+    monkeypatch.setattr(repair, "_vacuum_and_rebuild_fts5", _spy)
+
+    counts = repair.rebuild_from_sqlite(str(source), str(dest))
+
+    assert counts["mempalace_drawers"] == 1
+    assert calls == [(str(dest), True)]
+
+
+def test_rebuild_from_sqlite_cleanup_failure_is_not_reported_as_success(
+    tmp_path, monkeypatch, capsys
+):
+    source = tmp_path / "source"
+    dest = tmp_path / "dest"
+    _seed_palace(source, "mempalace_drawers", [("d1", "verbatim", {"wing": "w"})])
+
+    def _fail_cleanup(path, progress=print, *, strict=False):
+        assert path == str(dest)
+        assert strict is True
+        raise RuntimeError("simulated FTS5 rebuild failure")
+
+    monkeypatch.setattr(repair, "_vacuum_and_rebuild_fts5", _fail_cleanup)
+
+    with pytest.raises(repair.RebuildCleanupError) as excinfo:
+        repair.rebuild_from_sqlite(str(source), str(dest))
+
+    exc = excinfo.value
+    assert exc.counts["mempalace_drawers"] == 1
+    assert exc.dest_palace == str(dest)
+    assert exc.archive_path is None
+    assert dest.exists()
+    assert (source / "chroma.sqlite3").exists()
+    output = capsys.readouterr().out
+    assert "Rebuild complete" not in output
+    assert "Post-recovery cleanup failed" in output
+
+
 def test_rebuild_from_sqlite_refuses_existing_dest(tmp_path):
     """Refuse to write into a directory that already exists when source
     and dest differ. Without this, an unattended re-run would silently
@@ -2015,6 +2069,11 @@ def test_vacuum_and_rebuild_fts5_no_fts5_table(tmp_path):
 def test_vacuum_and_rebuild_fts5_missing_sqlite(tmp_path):
     """Silently skips when chroma.sqlite3 does not exist."""
     repair._vacuum_and_rebuild_fts5(str(tmp_path))  # no file — must not raise
+
+
+def test_vacuum_and_rebuild_fts5_strict_requires_sqlite(tmp_path):
+    with pytest.raises(FileNotFoundError, match="has no SQLite database"):
+        repair._vacuum_and_rebuild_fts5(str(tmp_path), strict=True)
 
 
 # ── FTS5 inverted-index auto-heal (#1596) ─────────────────────────────
