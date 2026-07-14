@@ -11,7 +11,14 @@ import pytest
 
 from _chroma_palace_helper import make_minimal_chroma_sqlite
 
-from mempalace.searcher import SearchError, build_where_filter, search, search_memories
+from mempalace.backends import BackendMismatchError
+from mempalace.searcher import (
+    SearchError,
+    build_where_filter,
+    get_collection,
+    search,
+    search_memories,
+)
 
 
 # ── build_where_filter (unit) ──────────────────────────────────────────
@@ -616,3 +623,22 @@ class TestSearchCLI:
         mock_probe.assert_not_called()
         mock_col.query.assert_called_once()
         assert "backend-native result" in capsys.readouterr().out
+
+    @pytest.mark.parametrize(
+        "resolution_error",
+        [BackendMismatchError("mixed backend artifacts"), KeyError("unknown_backend")],
+    )
+    def test_search_delegates_backend_resolution_errors_to_open_diagnostic(
+        self, fake_palace_path, resolution_error
+    ):
+        """The early HNSW fence must not replace normal CLI diagnostics."""
+        with (
+            patch("mempalace.searcher.resolve_backend_name", side_effect=resolution_error),
+            patch("mempalace.searcher._hnsw_capacity_diverged") as mock_probe,
+            patch("mempalace.searcher._open_collection_or_explain", return_value=None) as mock_open,
+        ):
+            with pytest.raises(SearchError):
+                search("anything", fake_palace_path)
+
+        mock_probe.assert_not_called()
+        mock_open.assert_called_once_with(fake_palace_path, opener=get_collection)

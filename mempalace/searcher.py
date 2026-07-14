@@ -498,7 +498,16 @@ def search(query: str, palace_path: str, wing: str = None, room: str = None, n_r
     # collection.count(); both happen before the old query-only guard and can
     # hit the same native crash. Non-Chroma backends never use Chroma's HNSW
     # files or sqlite-specific fallback and proceed normally.
-    if resolve_backend_name(palace_path) == "chroma" and _hnsw_capacity_diverged(palace_path):
+    try:
+        backend_name = resolve_backend_name(palace_path)
+    except (BackendMismatchError, KeyError):
+        # Preserve _open_collection_or_explain's state-specific diagnostics
+        # for mixed artifacts and unknown backend selections. This probe is
+        # only an early Chroma safety fence; it must not become a second,
+        # less-helpful backend validation path.
+        backend_name = None
+
+    if backend_name == "chroma" and _hnsw_capacity_diverged(palace_path):
         return _print_search_results_bm25_only(query, palace_path, wing, room, n_results)
 
     col = _open_collection_or_explain(palace_path, opener=get_collection)
