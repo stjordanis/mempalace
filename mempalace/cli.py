@@ -1132,7 +1132,7 @@ def cmd_repair(args):
 
     if getattr(args, "mode", "legacy") == "from-sqlite":
         from .migrate import confirm_destructive_action
-        from .repair import RebuildPartialError, rebuild_from_sqlite
+        from .repair import RebuildCleanupError, RebuildPartialError, rebuild_from_sqlite
 
         source_path = getattr(args, "source", None)
         source_path = (
@@ -1169,6 +1169,13 @@ def cmd_repair(args):
                 "\n  Rebuild partial — see message above. "
                 f"Failed in collection: {exc.failed_collection}"
             )
+            sys.exit(1)
+        except RebuildCleanupError:
+            # All rows may have landed, but rebuild_from_sqlite deliberately
+            # withholds success until FTS5 rebuild, VACUUM, and quick_check are
+            # clean. Its exception already includes the retained destination
+            # and archive/source recovery paths.
+            print("\n  Rebuild cleanup failed — see recovery details above.")
             sys.exit(1)
         # An empty counts dict is rebuild_from_sqlite's documented signal
         # for a validation refusal (missing source, existing dest,
