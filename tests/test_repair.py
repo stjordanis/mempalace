@@ -2076,6 +2076,22 @@ def test_vacuum_and_rebuild_fts5_strict_requires_sqlite(tmp_path):
         repair._vacuum_and_rebuild_fts5(str(tmp_path), strict=True)
 
 
+def test_vacuum_and_rebuild_fts5_strict_preserves_exception_type(tmp_path, monkeypatch):
+    sqlite_path = tmp_path / "chroma.sqlite3"
+    sqlite_path.touch()
+    messages = []
+
+    def _raise_database_error(*args, **kwargs):
+        raise sqlite3.DatabaseError("simulated cleanup failure")
+
+    monkeypatch.setattr(repair.sqlite3, "connect", _raise_database_error)
+
+    with pytest.raises(sqlite3.DatabaseError, match="simulated cleanup failure"):
+        repair._vacuum_and_rebuild_fts5(str(tmp_path), progress=messages.append, strict=True)
+
+    assert messages == []
+
+
 # ── FTS5 inverted-index auto-heal (#1596) ─────────────────────────────
 
 

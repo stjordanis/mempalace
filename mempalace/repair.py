@@ -926,8 +926,11 @@ def _vacuum_and_rebuild_fts5(
                 progress("  SQLite quick_check clean.")
     except Exception as exc:
         if strict:
-            progress(f"  ERROR: required post-recovery cleanup failed: {exc}")
-            raise RuntimeError(f"required post-recovery cleanup failed: {exc}") from exc
+            # Preserve the concrete SQLite/filesystem exception for callers
+            # that need to classify the failure. The strict recovery caller
+            # owns the user-facing error message, so logging here would also
+            # print the same failure twice.
+            raise
         progress(f"  Warning: post-repair cleanup failed (non-fatal): {exc}")
 
 
