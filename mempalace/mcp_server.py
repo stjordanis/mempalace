@@ -5188,6 +5188,28 @@ def _build_http_server(host: str, port: int):
         daemon_threads = True
         allow_reuse_address = True
 
+        def handle_error(self, request, client_address):
+            # A client hanging up mid-response makes the send path raise
+            # ConnectionError (BrokenPipeError / ConnectionResetError), or
+            # ssl.SSLEOFError over TLS. That is a routine disconnect, not a
+            # server fault, so log it at DEBUG rather than let the default
+            # handler dump a per-request traceback. Real errors (including
+            # genuine TLS handshake/cert failures) still reach that handler.
+            exc = sys.exc_info()[1]
+            is_disconnect = isinstance(exc, ConnectionError)
+            if not is_disconnect:
+                import ssl
+
+                # Only the abrupt-EOF SSLError; genuine TLS errors must surface.
+                is_disconnect = isinstance(exc, ssl.SSLEOFError)
+            if is_disconnect:
+                logger.debug(
+                    "HTTP client %s disconnected before the response completed",
+                    client_address,
+                )
+                return
+            super().handle_error(request, client_address)
+
     class _Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         timeout = 10
