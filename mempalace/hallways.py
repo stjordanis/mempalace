@@ -383,11 +383,11 @@ def list_hallways(wing: Optional[str] = None, config=None) -> list[dict]:
     return [h for h in all_hallways if h.get("wing") == wing]
 
 
-def delete_hallway(hallway_id: str) -> bool:
+def delete_hallway(hallway_id: str, config=None) -> bool:
     """Remove one hallway record by id. Returns True if a record was removed."""
-    hallways = _load_hallways()
+    hallways = _load_hallways(config)
     filtered = [h for h in hallways if h.get("id") != hallway_id]
     if len(filtered) == len(hallways):
         return False
-    _save_hallways(filtered)
+    _save_hallways(filtered, config)
     return True

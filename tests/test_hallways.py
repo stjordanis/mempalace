@@ -318,6 +318,19 @@ class TestHallwayQuery:
         hallways_mod._save_hallways([{"id": "h1", "wing": "wing_aya"}])
         assert hallways_mod.delete_hallway("nonexistent") is False
 
+    def test_delete_hallway_uses_selected_palace_config(self, tmp_path):
+        from mempalace.config import MempalaceConfig
+
+        default_cfg = MempalaceConfig(palace_path=tmp_path / "default" / "palace")
+        selected_cfg = MempalaceConfig(palace_path=tmp_path / "selected" / "palace")
+        record = {"id": "h1", "wing": "wing_aya"}
+        hallways_mod._save_hallways([record], default_cfg)
+        hallways_mod._save_hallways([record], selected_cfg)
+
+        assert hallways_mod.delete_hallway("h1", config=selected_cfg) is True
+        assert hallways_mod.list_hallways(config=selected_cfg) == []
+        assert hallways_mod.list_hallways(config=default_cfg) == [record]
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # L7 dynamics integration — hallway records carry strength/stability/etc
