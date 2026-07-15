@@ -11,6 +11,14 @@ from datetime import date, datetime
 from functools import lru_cache
 from pathlib import Path
 
+from .write_routing import (
+    ResolvedWriteRoutingPolicy,
+    RoutingPolicyCandidate,
+    WriteRoutingError,
+    WriteRoutingPolicy,
+    resolve_write_routing_policy,
+)
+
 # ── Input validation ──────────────────────────────────────────────────────────
 # Shared sanitizers for wing/room/entity names. Prevents path traversal,
 # excessively long strings, and special characters that could cause issues
@@ -886,6 +894,102 @@ class MempalaceConfig:
     def hook_desktop_toast(self):
         """Whether the stop hook shows a desktop notification via notify-send."""
         return self._file_config.get("hooks", {}).get("desktop_toast", False)
+
+    def resolve_write_routing(self, scope: str) -> ResolvedWriteRoutingPolicy:
+        """Resolve the configured write policy for ``hooks`` or ``cli``.
+
+        Precedence is:
+
+        1. scope-specific environment variable;
+        2. global environment variable;
+        3. legacy hook environment variable;
+        4. scope-specific config value;
+        5. global config value;
+        6. legacy hook config value;
+        7. ``direct``.
+
+        This foundation does not change current hook or CLI behavior. The
+        policy-aware consumers are introduced by follow-up PRs.
+        """
+
+        normalized_scope = str(scope).strip().lower()
+        env_names = {
+            "hooks": "MEMPALACE_HOOK_WRITE_ROUTING",
+            "cli": "MEMPALACE_CLI_WRITE_ROUTING",
+        }
+
+        if normalized_scope not in env_names:
+            raise WriteRoutingError("write routing scope must be 'hooks' or 'cli'")
+
+        routing_config = self._file_config.get("write_routing", {})
+        if routing_config is None:
+            routing_config = {}
+
+        if not isinstance(routing_config, dict):
+            raise WriteRoutingError("config write_routing must be an object")
+
+        candidates = [
+            RoutingPolicyCandidate(
+                env_names[normalized_scope],
+                os.environ.get(env_names[normalized_scope]),
+            ),
+            RoutingPolicyCandidate(
+                "MEMPALACE_WRITE_ROUTING",
+                os.environ.get("MEMPALACE_WRITE_ROUTING"),
+            ),
+        ]
+
+        if normalized_scope == "hooks":
+            candidates.append(
+                RoutingPolicyCandidate(
+                    "MEMPALACE_HOOKS_DAEMON (legacy)",
+                    os.environ.get("MEMPALACE_HOOKS_DAEMON"),
+                    legacy_boolean=True,
+                )
+            )
+
+        candidates.extend(
+            [
+                RoutingPolicyCandidate(
+                    f"config write_routing.{normalized_scope}",
+                    routing_config.get(normalized_scope),
+                ),
+                RoutingPolicyCandidate(
+                    "config write_routing.default",
+                    routing_config.get("default"),
+                ),
+            ]
+        )
+
+        if normalized_scope == "hooks":
+            hooks_config = self._file_config.get("hooks", {})
+            if hooks_config is None:
+                hooks_config = {}
+
+            if not isinstance(hooks_config, dict):
+                raise WriteRoutingError("config hooks must be an object")
+
+            candidates.append(
+                RoutingPolicyCandidate(
+                    "config hooks.daemon (legacy)",
+                    hooks_config.get("daemon"),
+                    legacy_boolean=True,
+                )
+            )
+
+        return resolve_write_routing_policy(candidates)
+
+    @property
+    def hook_write_routing(self) -> WriteRoutingPolicy:
+        """Resolved future routing policy for hook-triggered writes."""
+
+        return self.resolve_write_routing("hooks").policy
+
+    @property
+    def cli_write_routing(self) -> WriteRoutingPolicy:
+        """Resolved future routing policy for routine CLI writes."""
+
+        return self.resolve_write_routing("cli").policy
 
     @property
     def hook_use_daemon(self):
