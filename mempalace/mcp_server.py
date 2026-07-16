@@ -3898,7 +3898,7 @@ def tool_reconnect():
         return {"success": False, "error": str(e)}
 
 
-def tool_checkpoint(items, diary=None, dedup_threshold=0.9):
+def tool_checkpoint(items, diary=None, dedup_threshold=0.9, added_by=None):
     """Batch session save in a single call.
 
     Semantic-dedups each item, files the non-duplicates as drawers, then
@@ -3909,6 +3909,9 @@ def tool_checkpoint(items, diary=None, dedup_threshold=0.9):
 
     ``items`` is a list of ``{"wing", "room", "content"}`` dicts. ``diary``
     is an optional ``{"agent_name", "entry", "topic"?, "wing"?}`` dict.
+    ``added_by`` attributes the filed drawers; when omitted it falls back to
+    the diary's ``agent_name`` (and then to ``"checkpoint"``), so the agent
+    that filed the session is recorded instead of a generic label.
     Reuses the existing single-item handlers so dedup/idempotency/WAL
     behaviour is identical to calling them directly.
     """
@@ -3925,6 +3928,20 @@ def tool_checkpoint(items, diary=None, dedup_threshold=0.9):
     out = {"added": [], "duplicates": [], "errors": []}
     if not isinstance(items, list):
         return {"error": "items must be a list of {wing, room, content} objects"}
+    # Drawer attribution: an explicit ``added_by`` wins; otherwise fall back to
+    # the diary's ``agent_name`` (the agent filing this session); otherwise the
+    # legacy ``"checkpoint"`` label. A blank, whitespace-only, or non-string
+    # value counts as unspecified at each step, so an empty explicit argument
+    # still defers to the diary instead of masking it. The chosen name is stored
+    # verbatim (tool_add_drawer strips lone surrogates but does not case-fold),
+    # matching how every other caller records ``added_by``; the diary index
+    # lowercases the same name separately for case-insensitive reads.
+    resolved_added_by = added_by if isinstance(added_by, str) and added_by.strip() else None
+    if resolved_added_by is None and isinstance(diary, dict):
+        agent = diary.get("agent_name")
+        resolved_added_by = agent if isinstance(agent, str) and agent.strip() else None
+    if resolved_added_by is None:
+        resolved_added_by = "checkpoint"
     for item in items:
         if not isinstance(item, dict):
             out["errors"].append({"item": item, "error": "item must be an object"})
@@ -3947,7 +3964,7 @@ def tool_checkpoint(items, diary=None, dedup_threshold=0.9):
         # string by the guard above) we still file rather than drop the
         # memory: verbatim recall is the priority and add_drawer's own
         # idempotency blocks exact duplicates.
-        res = tool_add_drawer(wing=wing, room=room, content=content, added_by="checkpoint")
+        res = tool_add_drawer(wing=wing, room=room, content=content, added_by=resolved_added_by)
         if res.get("success"):
             out["added"].append(res)
         else:
@@ -4351,6 +4368,10 @@ TOOLS = {
                 "dedup_threshold": {
                     "type": "number",
                     "description": "Similarity threshold 0-1 for the per-item dedup check (default 0.9)",
+                },
+                "added_by": {
+                    "type": "string",
+                    "description": "Who is filing these drawers. An explicit value takes precedence; otherwise the diary agent_name, else 'checkpoint'.",
                 },
             },
             "required": ["items"],
